@@ -1,0 +1,11 @@
+# Build and vendored deps (heavy / rebuildable)
+third_party/
+build/
+*.o
+*.a
+*.7z
+*.zip
+*.log
+
+# Temp
+editor-rename.tmp

@@ -1,0 +1,50 @@
+# 内网安全代码编辑器（CodeEditor）
+
+防记事本改坏文件的代码编辑器：**打开什么格式，保存后就是什么格式**——编码、BOM、换行符原样保持。
+
+- 单文件 exe，零运行时依赖（静态链接 + msvcrt）
+- Windows 7 SP1 / Windows 10，32/64 位通吃（32 位 exe，x64 经 WOW64）
+- 语法高亮：ini/cfg/conf/properties、json/xml/yaml、sql、py/js/html/css/bat 等 29 种
+- 编码检测：UTF-8 BOM / UTF-8 无 BOM / UTF-16LE / UTF-16BE / ANSI(GBK)，保存不转换
+- 行尾保持：CRLF / LF / CR，粘贴不强制转换
+- 自动缩进、查找/替换、行号、状态栏显示编码与行尾
+
+## 使用
+
+双击 `dist\CodeEditor.exe`（或 `代码编辑器.exe`）即用，无需安装。
+
+把文件拖进窗口、或命令行传文件路径均可打开。
+
+需要接管文件类型（双击 .txt/.ini/.json 等默认用它打开）：
+
+- 程序内：`帮助` → `设为默认打开方式`
+- 或命令行：`CodeEditor.exe --register`
+
+取消关联（恢复设置前的状态，不影响其他程序）：
+
+- 程序内：`帮助` → `解除文件关联`（会还原每个扩展名原来的默认程序）
+- 或命令行：`CodeEditor.exe --unregister`
+
+关联写在 `HKCU\Software\Classes`，不需要管理员权限。注册时会自动备份每个扩展名原来的归属，解除时还原；原本没有关联的扩展名还原为“未设置”。exe 移动位置后重新跑一次注册即可。
+
+## 自测
+
+```
+CodeEditor.exe --selftest
+```
+
+9 个用例：8 个字节级保持（UTF-8 BOM/无 BOM/GBK/UTF-16LE/BE/CR 行尾/嵌入 NUL/缩短回写/空文件）+ 1 个注册表关联往返（含“还原他人关联”断言，用替身 ProgID，不碰真实关联）。结果写 `%TEMP%\CodeEditorSelftest\selftest-result.txt`，退出码 0 = 全过。
+
+## 构建
+
+```
+build.bat
+```
+
+自动下载 MinGW-w64 i686（msvcrt）+ Scintilla 5.6.7 + Lexilla 5.5.4，编译静态库后链接出 `dist\CodeEditor.exe`。
+
+构建必须在 ASCII 路径进行（GNU ld 在含中文的路径下解析库文件失败）。`build.bat` 使用 ASCII 构建农场 `C:\cedb`：源码同步过去、在那里编译、产物拷回本目录。
+
+## 源码
+
+`src/main.cxx` 单文件，Win32 + Scintilla/Lexilla 静态链接。
