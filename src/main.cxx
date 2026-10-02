@@ -936,20 +936,22 @@ static bool ValidateFormat(std::wstring &err, int &line) {
 
 static void AddToMru(const std::wstring &path) {
     if (g_mruSuppress) return;
-    if (g_mruCount > 0 && _wcsicmp(g_mru[0].c_str(), path.c_str()) == 0) return;
-    int count = g_mruCount;
-    int limit = (count < 8) ? count : 7;
-    for (int i = limit; i > 0; --i) g_mru[i] = g_mru[i - 1];
-    g_mru[0] = path;
-    if (count < 8) ++g_mruCount;
-    // drop any duplicate occurrence further down
-    for (int i = 1; i < g_mruCount; ) {
-        if (_wcsicmp(g_mru[i].c_str(), path.c_str()) == 0) {
-            for (int j = i; j + 1 < g_mruCount; ++j) g_mru[j] = g_mru[j + 1];
-            g_mru[g_mruCount - 1].clear();
-            --g_mruCount;
-        } else ++i;
+    // remove an existing occurrence first (shifting left), then insert at top
+    // and trim — this keeps exactly 8 distinct entries (trim-before-dedup
+    // would drop the oldest entry even though a slot was freed).
+    int found = -1;
+    for (int i = 0; i < g_mruCount; ++i) {
+        if (_wcsicmp(g_mru[i].c_str(), path.c_str()) == 0) { found = i; break; }
     }
+    if (found == 0) return;                       // already newest
+    if (found > 0) {
+        for (int j = found; j + 1 < g_mruCount; ++j) g_mru[j] = g_mru[j + 1];
+        --g_mruCount;
+    }
+    int top = (g_mruCount < 8) ? g_mruCount : 7;
+    for (int i = top; i > 0; --i) g_mru[i] = g_mru[i - 1];
+    g_mru[0] = path;
+    if (g_mruCount < 8) ++g_mruCount;
     SaveMru();
 }
 
@@ -1722,12 +1724,13 @@ static bool RunSelftest() {
     std::wstring resultPath = base + L"\\selftest-result.txt";
     FILE *rf = _wfopen(resultPath.c_str(), L"wb, ccs=UTF-8");
     int pass = 0;
-    // +1 assoc-reg case +1 format-validate case (both appended below).
+    // +4 extra cases appended below: assoc-reg, format-validate,
+    // backup-overwrite, force-reload.
     // Suppress MRU writes during selftest so temporary .dat files never leak
     // into the real recent-files list.
     bool mruWasEnabled = g_mruSuppress;
     g_mruSuppress = true;
-    int total = (int)cases.size() + 2;
+    int total = (int)cases.size() + 4;
     for (size_t i = 0; i < cases.size(); ++i) {
         const TestCase &c = cases[i];
         std::wstring in = base + L"\\in_" + std::to_wstring(i) + L".dat";
@@ -1838,14 +1841,69 @@ static bool RunSelftest() {
         Scim<void>(SCI_SETTEXT, 0, (sptr_t)"<root><item></root>");
         g_filePath = L"selftest.xml";
         bool okXml = !ValidateFormat(err, line) && line > 0;
-        bool vpass = okValid && okBroken && okXml;
+        // edge: escaped quote and braces inside JSON string are legal
+        Scim<void>(SCI_SETTEXT, 0, (sptr_t)"{\"a\":\"b\\\"c\",\"s\":\"{[]}\"}");
+        g_filePath = L"selftest.json";
+        bool okEsc = ValidateFormat(err, line);
+        // edge: valid XML with attribute, self-closing tag, comment with '>'
+        Scim<void>(SCI_SETTEXT, 0,
+            (sptr_t)"<root a=\"1\"><b/><!-- c > d --></root>");
+        g_filePath = L"selftest.xml";
+        bool okXmlOk = ValidateFormat(err, line);
+        bool vpass = okValid && okBroken && okXml && okEsc && okXmlOk;
         if (vpass) ++pass;
-        char line2[200];
+        char line2[240];
         sprintf_s(line2, sizeof(line2),
-            "format-validate: %s (valid=%d broken=%d xml=%d)\r\n",
-            vpass ? "PASS" : "FAIL", okValid ? 1 : 0, okBroken ? 1 : 0, okXml ? 1 : 0);
+            "format-validate: %s (valid=%d broken=%d xml=%d esc=%d xmlok=%d)\r\n",
+            vpass ? "PASS" : "FAIL", okValid ? 1 : 0, okBroken ? 1 : 0,
+            okXml ? 1 : 0, okEsc ? 1 : 0, okXmlOk ? 1 : 0);
         LogLine(rf, line2);
-        // restore selftest environment
+        g_filePath.clear();
+    }
+
+    // 11. backup-on-overwrite: SaveFile must leave the previous content in .bak
+    {
+        std::wstring in = base + L"\\bak_in.dat";
+        std::wstring out = base + L"\\bak_out.dat";
+        std::wstring bak = out + L".bak";
+        DeleteFileW(bak.c_str());
+        WriteBytes(in, std::vector<char>{ 'N', 'E', 'W' });
+        WriteBytes(out, std::vector<char>{ 'O', 'L', 'D' });
+        bool ok = LoadFile(in, false);
+        if (ok) { g_filePath = out; ok = SaveFile(out); }
+        std::vector<char> bakData, outData;
+        ReadFileBytes(bak, bakData);
+        ReadFileBytes(out, outData);
+        std::vector<char> wantOld{ 'O', 'L', 'D' }, wantNew{ 'N', 'E', 'W' };
+        bool bpass = ok && bakData == wantOld && outData == wantNew;
+        if (bpass) ++pass;
+        char line3[160];
+        sprintf_s(line3, sizeof(line3),
+            "backup-overwrite: %s (bak=%s out=%s)\r\n", bpass ? "PASS" : "FAIL",
+            bakData == wantOld ? "OLD" : "?",
+            outData == wantNew ? "NEW" : "?");
+        LogLine(rf, line3);
+    }
+
+    // 12. force-reload: LoadFile(path, attach, forceMode) honours the override
+    {
+        std::wstring p = base + L"\\fr.dat";
+        WriteBytes(p, std::vector<char>{ 'A', (char)0xE4, (char)0xB8, (char)0xAD });
+        bool a = LoadFile(p, false, 0);        // force UTF-8
+        bool okA = a && g_mode == MODE_UTF8 && !g_hasBom;
+        bool b = LoadFile(p, false, 1);        // force GBK
+        bool okB = b && g_mode == MODE_ANSI;
+        std::wstring p2 = base + L"\\fr16.dat";
+        WriteBytes(p2, std::vector<char>{ (char)0xFF, (char)0xFE, 'A', 0, 'B', 0 });
+        bool c = LoadFile(p2, false, 2);       // force UTF-16LE
+        bool okC = c && g_mode == MODE_UTF16LE && g_hasBom;
+        bool fpass = okA && okB && okC;
+        if (fpass) ++pass;
+        char line4[200];
+        sprintf_s(line4, sizeof(line4),
+            "force-reload: %s (utf8=%d gbk=%d utf16=%d)\r\n",
+            fpass ? "PASS" : "FAIL", okA ? 1 : 0, okB ? 1 : 0, okC ? 1 : 0);
+        LogLine(rf, line4);
         g_filePath.clear();
         g_mruSuppress = mruWasEnabled;
         Scim<void>(SCI_SETTEXT, 0, (sptr_t)"");
@@ -1984,6 +2042,11 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmdLineIn, int nShow) {
     };
     HACCEL hAcc = CreateAcceleratorTableW(acc, 9);
 
+    // V5: load recent-files cache for every path that may open files; writes
+    // are suppressed in selftest (g_mruSuppress), uicheck accumulates normally.
+    LoadMru();
+    CheckMenuItem(menu, IDM_VIEW_EOL, MF_BYCOMMAND | MF_CHECKED);
+
     if (selftest) {
         ShowWindow(hwnd, SW_HIDE);
         bool ok = RunSelftest();
@@ -1994,9 +2057,6 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmdLineIn, int nShow) {
         bool ok = RunUiCheck(hwnd, openFile);
         return ok ? 0 : 1;
     }
-    // V5: recent-files cache + view menu checkmark (GUI path only)
-    LoadMru();
-    CheckMenuItem(menu, IDM_VIEW_EOL, MF_BYCOMMAND | MF_CHECKED);
 
     if (!openFile.empty()) LoadFile(openFile);
 
