@@ -48,3 +48,13 @@ build.bat
 ## 源码
 
 `src/main.cxx` 单文件，Win32 + Scintilla/Lexilla 静态链接。
+
+## 许可证
+
+本项目源码采用 [MIT 许可证](LICENSE)。
+
+本项目包含或链接以下第三方组件，其许可证声明见 [NOTICE.md](NOTICE.md)：
+- **Scintilla** 5.6.7（编辑器控件）
+- **Lexilla** 5.5.4（语法词法分析器）
+- MinGW-w64（仅构建期工具链，不进入交付物）
+
