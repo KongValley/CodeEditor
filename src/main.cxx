@@ -36,6 +36,24 @@ static bool g_hasBom = false;
 static char g_bom[3] = { 0, 0, 0 };
 static int g_bomLen = 0;
 static int g_eolMode = SC_EOL_CRLF;
+// --- V5 globals (used by LoadFile and friends defined earlier in the file) ---
+static FILETIME g_fileTime;
+static bool g_fileTimeValid = false;
+static bool g_viewEol = true;
+static bool g_readOnly = false;
+static int g_zoom = 0;
+static std::wstring g_mru[8];
+static int g_mruCount = 0;
+static bool g_mruSuppress = false;   // selftest must not touch the real MRU
+static HMENU g_mRecentMenu = nullptr;   // recent-files submenu (V5)
+static void AddToMru(const std::wstring &path);
+static void SaveMru();
+static void LoadMru();
+static void RefreshFileTime(const std::wstring &path);
+static void ReportFormatStatus(const std::wstring &path);
+static void SetStatusPart2(const wchar_t *s);
+static bool ValidateFormat(std::wstring &err, int &line);
+static void ApplyZoom(int delta);
 
 static const wchar_t *kClassName = L"IntranetEditorWnd";
 static const wchar_t *kAppTitle = L"\u4ee3\u7801\u7f16\u8f91\u5668";           // 代码编辑器
@@ -57,6 +75,14 @@ static const int kMaxFileBytes = 256 * 1024 * 1024;
 #define IDM_ABOUT     1013
 #define IDM_REGASSOC  1014
 #define IDM_UNREGASSOC 1015
+#define IDM_RELOAD_UTF8  1016
+#define IDM_RELOAD_GBK   1017
+#define IDM_RELOAD_UTF16 1018
+#define IDM_ZOOM_IN    1019
+#define IDM_ZOOM_OUT   1020
+#define IDM_ZOOM_RESET 1021
+#define IDM_VIEW_EOL   1022
+#define IDM_MRU_BASE   1100
 
 #define WM_APP_TITLE   (WM_APP + 1)
 #define WM_APP_STATUS  (WM_APP + 2)
@@ -462,7 +488,9 @@ static bool ReadFileBytes(const std::wstring &path, std::vector<char> &buf) {
 // ---------------------------------------------------------------------------
 // Load file into the editor per the plan's algorithm.
 
-static bool LoadFile(const std::wstring &path, bool attachLexer = true) {
+// forceMode: -1 auto-detect; 0 force UTF-8; 1 force GBK/ANSI; 2 force UTF-16LE.
+static bool LoadFile(const std::wstring &path, bool attachLexer = true,
+    int forceMode = -1) {
     std::vector<char> buf;
     if (!ReadFileBytes(path, buf)) {
         ShowError(L"\u65e0\u6cd5\u6253\u5f00\u6587\u4ef6\uff1a", path);
@@ -478,6 +506,24 @@ static bool LoadFile(const std::wstring &path, bool attachLexer = true) {
     char bom[3] = { 0, 0, 0 };
     DetectFormat(buf, mode, hasBom, bom);
     int bomLen = BomLenOf(mode, hasBom);
+
+    if (forceMode >= 0) {
+        // user-forced re-read (Edit > Reload as...): keep any detected BOM
+        // skipped, but reinterpret the body with the chosen encoding.
+        if (forceMode == 0) {
+            hasBom = (mode == MODE_UTF8 && hasBom);
+            mode = MODE_UTF8;
+            bomLen = hasBom ? 3 : 0;
+        } else if (forceMode == 1) {
+            hasBom = false;
+            mode = MODE_ANSI;
+            bomLen = 0;   // GBK view: no BOM concept
+        } else if (forceMode == 2) {
+            hasBom = (mode == MODE_UTF16LE && hasBom);
+            mode = MODE_UTF16LE;
+            bomLen = hasBom ? 2 : 0;
+        }
+    }
 
     std::string text;
     bool decoded = DecodeToText(buf, mode, bomLen, text);
@@ -679,10 +725,23 @@ static bool LoadFile(const std::wstring &path, bool attachLexer = true) {
 
     Scim<void>(SCI_SETSAVEPOINT);
     Scim<void>(SCI_EMPTYUNDOBUFFER);
+    // V5: EOL/whitespace visibility (toggle in View menu)
+    Scim<void>(SCI_SETVIEWEOL, g_viewEol ? 1 : 0);
+    Scim<void>(SCI_SETWHITESPACESIZE, 1);
+    Scim<void>(SCI_SETWHITESPACEFORE, 0x3A3D41);
+    Scim<void>(SCI_SETZOOM, (uptr_t)g_zoom);
 
     g_filePath = path;
     g_mode = mode; g_hasBom = hasBom; g_bomLen = bomLen;
     memcpy(g_bom, bom, sizeof(g_bom));
+    RefreshFileTime(path);   // baseline for external-change detection
+    // V5: read-only notice (inform, don't lock)
+    {
+        DWORD attr = GetFileAttributesW(path.c_str());
+        g_readOnly = attr != INVALID_FILE_ATTRIBUTES &&
+            (attr & FILE_ATTRIBUTE_READONLY) != 0;
+    }
+    AddToMru(path);          // V5: remember for the File menu
 
     if (g_status) {
         const wchar_t *modeTxt = L"ANSI";
@@ -692,7 +751,8 @@ static bool LoadFile(const std::wstring &path, bool attachLexer = true) {
         const wchar_t *eolTxt = g_eolMode == SC_EOL_CR ? L"CR" :
             (g_eolMode == SC_EOL_LF ? L"LF" : L"CRLF");
         wchar_t s[64];
-        wsprintfW(s, L"%s | %s", modeTxt, eolTxt);
+        wsprintfW(s, L"%s | %s%s", modeTxt, eolTxt,
+            g_readOnly ? L" | \u53ea\u8bfb" : L"");
         SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)s);
     }
     if (g_hwnd) SendMessageW(g_hwnd, WM_APP_TITLE, 0, 0);
@@ -702,6 +762,7 @@ static bool LoadFile(const std::wstring &path, bool attachLexer = true) {
 static void UpdateTitle() {
     std::wstring t;
     if (Scim<int>(SCI_GETMODIFY, 0, 0)) t += L"*";
+    if (g_readOnly) t += L"[\u53ea\u8bfb] ";
     if (!g_filePath.empty()) t += BaseName(g_filePath);
     else t += L"\u65b0\u5efa";
     t += L" - ";
@@ -752,8 +813,229 @@ static std::string DocText() {
     return std::string(&tmp[0], len);
 }
 
+// V5: zoom (Scintilla zoom points; clamp to sane range)
+static void ApplyZoom(int delta) {
+    g_zoom += delta;
+    if (g_zoom < -10) g_zoom = -10;
+    if (g_zoom > 20) g_zoom = 20;
+    if (g_sci) Scim<void>(SCI_SETZOOM, (uptr_t)g_zoom);
+}
+
+// V5: heuristic structure check for json / xml-ish files before saving.
+// Returns false with err (reason) and line (1-based) when suspicious.
+static bool ValidateFormat(std::wstring &err, int &line) {
+    line = 0;
+    std::wstring ext = ExtOf(g_filePath);
+    bool isJson = (ext == L"json");
+    bool isXml = (ext == L"xml" || ext == L"html" || ext == L"htm");
+    if (!isJson && !isXml) return true;
+
+    std::string text = DocText();
+    size_t n = text.size();
+    auto lineOf = [&](size_t pos) -> int {
+        sptr_t p = (sptr_t)pos;
+        if (p > (sptr_t)n) p = (sptr_t)n;
+        return (int)Scim<sptr_t>(SCI_LINEFROMPOSITION, (uptr_t)p, 0) + 1;
+    };
+
+    if (isJson) {
+        std::vector<char> stack;
+        bool inStr = false, esc = false;
+        for (size_t i = 0; i < n; ++i) {
+            char c = text[i];
+            if (inStr) {
+                if (esc) { esc = false; continue; }
+                if (c == '\\') { esc = true; continue; }
+                if (c == '"') inStr = false;
+                continue;
+            }
+            if (c == '"') { inStr = true; continue; }
+            if (c == '{' || c == '[') stack.push_back(c);
+            else if (c == '}' || c == ']') {
+                char want = (c == '}') ? '{' : '[';
+                if (stack.empty() || stack.back() != want) {
+                    err = (c == '}') ? L"\u62ec\u53f7 } \u4e0d\u914d\u5e73"
+                                     : L"\u62ec\u53f7 ] \u4e0d\u914d\u5e73";
+                    line = lineOf(i);
+                    return false;
+                }
+                stack.pop_back();
+            }
+        }
+        if (inStr) { err = L"\u5f15\u53f7\u672a\u95ed\u5408"; line = lineOf(n); return false; }
+        if (!stack.empty()) {
+            err = (stack.back() == '{') ? L"\u62ec\u53f7 { \u672a\u95ed\u5408"
+                                        : L"\u62ec\u53f7 [ \u672a\u95ed\u5408";
+            line = lineOf(n);
+            return false;
+        }
+        return true;
+    }
+
+    // xml-ish: tag stack (skips comments, declarations, CDATA, self-closing)
+    std::vector<std::string> stack;
+    size_t i = 0;
+    while (i < n) {
+        if (text[i] != '<') { ++i; continue; }
+        if (i + 3 < n && text.compare(i, 4, "<!--") == 0) {
+            size_t e = text.find("-->", i + 4);
+            if (e == std::string::npos) {
+                err = L"\u6ce8\u91ca <!-- \u672a\u95ed\u5408";
+                line = lineOf(i);
+                return false;
+            }
+            i = e + 3;
+            continue;
+        }
+        if (i + 8 < n && text.compare(i, 9, "<![CDATA[") == 0) {
+            size_t e = text.find("]]>", i + 9);
+            if (e == std::string::npos) {
+                err = L"CDATA \u672a\u95ed\u5408";
+                line = lineOf(i);
+                return false;
+            }
+            i = e + 3;
+            continue;
+        }
+        size_t e = text.find('>', i + 1);
+        if (e == std::string::npos) { err = L"<\u6807\u7b7e\u672a\u95ed\u5408"; line = lineOf(i); return false; }
+        std::string t = text.substr(i + 1, e - i - 1);
+        i = e + 1;
+        if (t.empty() || t[0] == '?' || t[0] == '!') continue;   // <?xml ?> / <!DOCTYPE >
+        if (t[0] == '/') {
+            std::string name = t.substr(1);
+            while (!name.empty() && (name.back() == ' ' || name.back() == '\t' ||
+                   name.back() == '\r' || name.back() == '\n')) name.pop_back();
+            if (stack.empty() || stack.back() != name) {
+                err = L"\u6807\u7b7e </" + std::wstring(name.begin(), name.end()) +
+                    L"> \u4e0d\u5339\u914d";
+                line = lineOf(i);
+                return false;
+            }
+            stack.pop_back();
+            continue;
+        }
+        if (!t.empty() && t.back() == '/') continue;   // self-closing
+        // opening tag: strip attributes
+        size_t sp = t.find_first_of(" \t\r\n");
+        std::string name = (sp == std::string::npos) ? t : t.substr(0, sp);
+        if (name.empty()) continue;
+        stack.push_back(name);
+    }
+    if (!stack.empty()) {
+        err = L"\u6807\u7b7e <" + std::wstring(stack.back().begin(), stack.back().end()) +
+            L"> \u672a\u95ed\u5408";
+        line = lineOf(n);
+        return false;
+    }
+    return true;
+}
+
+// --- external change detection & format reporting (V5) ---
+// (globals declared at the top of the file)
+
+static void AddToMru(const std::wstring &path) {
+    if (g_mruSuppress) return;
+    if (g_mruCount > 0 && _wcsicmp(g_mru[0].c_str(), path.c_str()) == 0) return;
+    int count = g_mruCount;
+    int limit = (count < 8) ? count : 7;
+    for (int i = limit; i > 0; --i) g_mru[i] = g_mru[i - 1];
+    g_mru[0] = path;
+    if (count < 8) ++g_mruCount;
+    // drop any duplicate occurrence further down
+    for (int i = 1; i < g_mruCount; ) {
+        if (_wcsicmp(g_mru[i].c_str(), path.c_str()) == 0) {
+            for (int j = i; j + 1 < g_mruCount; ++j) g_mru[j] = g_mru[j + 1];
+            g_mru[g_mruCount - 1].clear();
+            --g_mruCount;
+        } else ++i;
+    }
+    SaveMru();
+}
+
+static void SaveMru() {
+    if (g_mruCount <= 0) return;
+    size_t bytes = 0;
+    for (int i = 0; i < g_mruCount; ++i) bytes += (g_mru[i].size() + 1) * sizeof(wchar_t);
+    bytes += sizeof(wchar_t);   // final terminator
+    std::vector<wchar_t> buf(bytes / sizeof(wchar_t), 0);
+    size_t off = 0;
+    for (int i = 0; i < g_mruCount; ++i) {
+        memcpy(&buf[off], g_mru[i].c_str(), g_mru[i].size() * sizeof(wchar_t));
+        off += g_mru[i].size() + 1;
+    }
+    HKEY h;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\CodeEditor", 0, nullptr, 0,
+            KEY_SET_VALUE, nullptr, &h, nullptr) == ERROR_SUCCESS) {
+        RegSetValueExW(h, L"MRU", 0, REG_MULTI_SZ, (const BYTE *)&buf[0], (DWORD)bytes);
+        RegCloseKey(h);
+    }
+}
+
+static void LoadMru() {
+    HKEY h;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\CodeEditor", 0,
+            KEY_QUERY_VALUE, &h) != ERROR_SUCCESS)
+        return;
+    wchar_t buf[8 * 512];
+    DWORD n = sizeof(buf);
+    DWORD type = 0;
+    if (RegQueryValueExW(h, L"MRU", nullptr, &type, (LPBYTE)buf, &n) == ERROR_SUCCESS
+        && type == REG_MULTI_SZ) {
+        const wchar_t *p = buf;
+        const wchar_t *end = buf + n / sizeof(wchar_t);
+        g_mruCount = 0;
+        while (p < end && *p && g_mruCount < 8) {
+            size_t len = wcslen(p);
+            g_mru[g_mruCount++] = std::wstring(p, len);
+            p += len + 1;
+        }
+    }
+    RegCloseKey(h);
+}
+
+static bool GetModifyTime(const std::wstring &path, FILETIME &out) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ |
+        FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    FILETIME c, a;
+    bool ok = GetFileTime(h, &c, &a, &out) != FALSE;
+    CloseHandle(h);
+    return ok;
+}
+
+static void RefreshFileTime(const std::wstring &path) {
+    g_fileTimeValid = GetModifyTime(path, g_fileTime);
+}
+
+static bool FileWasModifiedExternally() {
+    if (!g_fileTimeValid || g_filePath.empty()) return false;
+    FILETIME now;
+    if (!GetModifyTime(g_filePath, now)) return false;
+    return memcmp(&now, &g_fileTime, sizeof(FILETIME)) != 0;
+}
+
+// Re-read the just-saved file and report whether encoding/BOM survived.
+static void ReportFormatStatus(const std::wstring &path) {
+    std::vector<char> buf;
+    if (!ReadFileBytes(path, buf)) return;
+    LoadMode m = MODE_ANSI; bool b = false; char bom[3] = { 0, 0, 0 };
+    DetectFormat(buf, m, b, bom);
+    bool same = (m == g_mode) && (b == g_hasBom);
+    SetStatusPart2(same ? L"\u683c\u5f0f: \u5df2\u4fdd\u6301"
+                        : L"\u683c\u5f0f: \u5df2\u53d8\u5316");
+}
+
 static bool SaveFile(const std::wstring &path) {
     bool exists = GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+    // automatic backup of the previous content before overwriting
+    if (exists) {
+        if (!CopyFileW(path.c_str(), (path + L".bak").c_str(), FALSE)) {
+            MessageBoxW(g_hwnd,
+                L"\u81ea\u52a8\u5907\u4efd\u5931\u8d25\uff08\u5c06\u7ee7\u7eed\u4fdd\u5b58\uff09\u3002",
+                kAppTitle, MB_OK | MB_ICONWARNING);
+        }
+    }
     HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
         exists ? OPEN_EXISTING : CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) {
@@ -781,7 +1063,9 @@ static bool SaveFile(const std::wstring &path) {
 
     Scim<void>(SCI_SETSAVEPOINT);
     g_filePath = path;
-    UpdateTitle();
+    RefreshFileTime(path);      // own save must not trigger external-change alert
+    UpdateTitle();              // refresh title first...
+    ReportFormatStatus(path);   // ...then the format verdict (overwrites part [2])
     return true;
 fail:
     ShowError(L"\u5199\u5165\u6587\u4ef6\u5931\u8d25\uff1a", path);
@@ -894,6 +1178,30 @@ static std::string WideToUtf8(const wchar_t *w) {
 
 static void FindNext(bool fromSelection);
 
+// write status bar part [2] (shared by find counter / modified marker)
+static void SetStatusPart2(const wchar_t *s) {
+    if (g_status) SendMessageW(g_status, SB_SETTEXTW, 2, (LPARAM)s);
+}
+
+// count all matches of the current find text (capped for pathological cases)
+static int CountMatches() {
+    if (g_findText.empty()) return 0;
+    int count = 0;
+    Scim<void>(SCI_SETSEARCHFLAGS, g_findMatchCase ? SCFIND_MATCHCASE : 0);
+    sptr_t len = Scim<sptr_t>(SCI_GETLENGTH, 0, 0);
+    sptr_t scan = 0;
+    while (count < 9999 && scan <= len) {
+        Scim<void>(SCI_SETTARGETSTART, (uptr_t)scan);
+        Scim<void>(SCI_SETTARGETEND, (uptr_t)len);
+        int pos = Scim<int>(SCI_SEARCHINTARGET, (uptr_t)g_findText.size(),
+            (sptr_t)g_findText.c_str());
+        if (pos < 0) break;
+        ++count;
+        scan = (sptr_t)pos + (sptr_t)g_findText.size();
+    }
+    return count;
+}
+
 static void OnFindReplMessage(WPARAM wParam, LPARAM lParam) {
     if (wParam != 0) return;
     FINDREPLACEW *fr = (FINDREPLACEW *)lParam;
@@ -906,6 +1214,17 @@ static void OnFindReplMessage(WPARAM wParam, LPARAM lParam) {
     if (doReplace) {
         std::string rep = WideToUtf8(fr->lpstrReplaceWith);
         if (all) {
+            int total = CountMatches();
+            if (total == 0) {
+                SetStatusPart2(L"\u65e0\u5339\u914d");
+                return;
+            }
+            wchar_t ask[128];
+            wsprintfW(ask, L"\u786e\u5b9a\u8981\u66ff\u6362\u5168\u90e8 %d \u5904\u5417\uff1f", total);
+            if (MessageBoxW(g_hwnd, ask, kAppTitle, MB_OKCANCEL | MB_ICONQUESTION) != IDOK)
+                return;
+            wchar_t done[64];
+            wsprintfW(done, L"\u5df2\u66ff\u6362 %d \u5904", total);
             while (!g_findText.empty()) {
                 Scim<void>(SCI_SETSEARCHFLAGS, g_findMatchCase ? SCFIND_MATCHCASE : 0);
                 sptr_t from = Scim<sptr_t>(SCI_GETTARGETEND, 0, 0);
@@ -922,6 +1241,7 @@ static void OnFindReplMessage(WPARAM wParam, LPARAM lParam) {
                 Scim<void>(SCI_SETTARGETSTART, (uptr_t)(pos + (int)rep.size()));
                 Scim<void>(SCI_SETTARGETEND, (uptr_t)pos);
             }
+            SetStatusPart2(done);
         } else if (fr->Flags & FR_REPLACE) {
             Scim<void>(SCI_TARGETFROMSELECTION);
             std::string rep = WideToUtf8(fr->lpstrReplaceWith);
@@ -941,7 +1261,7 @@ static void DoFind() {
     g_fr.lpstrReplaceWith = g_repBuf;
     g_fr.wFindWhatLen = 256;
     g_fr.wReplaceWithLen = 256;
-    g_fr.Flags = FR_DOWN;
+    g_fr.Flags = FR_DOWN | (g_findMatchCase ? FR_MATCHCASE : 0);
     g_hwndFind = FindTextW(&g_fr);
     if (!g_hwndFind) ShowError(L"\u65e0\u6cd5\u6253\u5f00\u67e5\u627e\u5bf9\u8bdd\u6846\uff1a", L"");
 }
@@ -959,11 +1279,20 @@ static void FindNext(bool fromSelection) {
     int pos = Scim<int>(SCI_SEARCHINTARGET, (uptr_t)g_findText.size(),
         (sptr_t)g_findText.c_str());
     if (pos < 0) {
+        int n = CountMatches();
+        wchar_t s[64];
+        if (n > 0) wsprintfW(s, L"\u5339\u914d %d \u5904", n);
+        else wcscpy(s, L"\u65e0\u5339\u914d");
+        SetStatusPart2(s);
         MessageBoxW(g_hwnd, L"\u5df2\u5230\u6587\u4ef6\u672b\u5c3e\u3002", kAppTitle,
             MB_OK | MB_ICONINFORMATION);
         return;
     }
     Scim<void>(SCI_SETSEL, (uptr_t)pos, (uptr_t)(pos + (int)g_findText.size()));
+    int n = CountMatches();
+    wchar_t s[64];
+    wsprintfW(s, L"\u5339\u914d %d \u5904", n);
+    SetStatusPart2(s);
 }
 
 // ---------------------------------------------------------------------------
@@ -1042,6 +1371,42 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (g_sci) MoveWindow(g_sci, 0, 0, rc.right, rc.bottom - sh, TRUE);
         return 0;
     }
+    case WM_ACTIVATE: {
+        // external-change check when the window regains focus (cheap: no polling)
+        if (LOWORD(wParam) != WA_INACTIVE && g_fileTimeValid &&
+            !g_filePath.empty() && FileWasModifiedExternally()) {
+            if (Scim<int>(SCI_GETMODIFY, 0, 0)) {
+                int r = MessageBoxW(hwnd,
+                    L"\u6587\u4ef6\u5df2\u88ab\u5176\u4ed6\u7a0b\u5e8f\u4fee\u6539\uff0c"
+                    L"\u662f\u5426\u91cd\u65b0\u52a0\u8f7d\uff1f",
+                    kAppTitle, MB_YESNO | MB_ICONQUESTION);
+                if (r == IDYES) LoadFile(g_filePath);
+                else RefreshFileTime(g_filePath);   // keep local edits
+            } else {
+                LoadFile(g_filePath);   // no local edits: silent reload
+            }
+        }
+        return 0;
+    }
+    case WM_INITMENUPOPUP: {
+        // V5: rebuild recent-files submenu contents on open
+        if ((HMENU)wParam == g_mRecentMenu && g_mRecentMenu) {
+            while (GetMenuItemCount(g_mRecentMenu) > 0)
+                DeleteMenu(g_mRecentMenu, 0, MF_BYPOSITION);
+            if (g_mruCount == 0) {
+                AppendMenuW(g_mRecentMenu, MF_STRING | MF_GRAYED, 0,
+                    L"\uff08\u65e0\uff09");
+            } else {
+                for (int i = 0; i < g_mruCount; ++i) {
+                    std::wstring label = std::to_wstring(i + 1) + L"  " +
+                        BaseName(g_mru[i]);
+                    AppendMenuW(g_mRecentMenu, MF_STRING,
+                        (UINT_PTR)(IDM_MRU_BASE + i), label.c_str());
+                }
+            }
+        }
+        return 0;
+    }
     case WM_DROPFILES: {
         HDROP hd = (HDROP)wParam;
         wchar_t path[MAX_PATH * 4] = L"";
@@ -1062,6 +1427,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             case SCN_SAVEPOINTREACHED:
             case SCN_SAVEPOINTLEFT:
                 UpdateTitle();
+                if (sc->nmhdr.code == SCN_SAVEPOINTREACHED && !g_filePath.empty())
+                    RefreshFileTime(g_filePath);   // own save: avoid self-trigger
                 break;
             case SCN_MARGINCLICK:
                 if (sc->margin == 1) {
@@ -1083,12 +1450,47 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_COMMAND: {
         switch (LOWORD(wParam)) {
         case IDM_OPEN: DoOpenDlg(); return 0;
-        case IDM_SAVE:
+        case IDM_SAVE: {
+            // V5: heuristic structure check before writing json/xml
+            if (!g_filePath.empty()) {
+                std::wstring verr; int vline = 0;
+                if (!ValidateFormat(verr, vline)) {
+                    wchar_t ask[256];
+                    wsprintfW(ask,
+                        L"\u7b2c %d \u884c\u53ef\u80fd\uff1a%s\u3002\u4ecd\u8981\u4fdd\u5b58\u5417\uff1f",
+                        vline, verr.c_str());
+                    if (MessageBoxW(hwnd, ask, kAppTitle,
+                            MB_OKCANCEL | MB_ICONWARNING) != IDOK)
+                        return 0;
+                }
+            }
             if (g_filePath.empty()) DoSaveAsDlg();
             else SaveFile(g_filePath);
             return 0;
+        }
         case IDM_SAVEAS: DoSaveAsDlg(); return 0;
         case IDM_EXIT: SendMessageW(hwnd, WM_CLOSE, 0, 0); return 0;
+        case IDM_RELOAD_UTF8:
+        case IDM_RELOAD_GBK:
+        case IDM_RELOAD_UTF16: {
+            if (g_filePath.empty()) return 0;
+            if (!PromptSaveIfDirty()) return 0;
+            int m = (LOWORD(wParam) == IDM_RELOAD_UTF8) ? 0
+                  : (LOWORD(wParam) == IDM_RELOAD_GBK) ? 1 : 2;
+            LoadFile(g_filePath, true, m);
+            return 0;
+        }
+        case IDM_ZOOM_IN: ApplyZoom(1); return 0;
+        case IDM_ZOOM_OUT: ApplyZoom(-1); return 0;
+        case IDM_ZOOM_RESET: ApplyZoom(-g_zoom); return 0;
+        case IDM_VIEW_EOL: {
+            g_viewEol = !g_viewEol;
+            Scim<void>(SCI_SETVIEWEOL, g_viewEol ? 1 : 0);
+            HMENU hm = GetMenu(hwnd);
+            CheckMenuItem(hm, IDM_VIEW_EOL,
+                MF_BYCOMMAND | (g_viewEol ? MF_CHECKED : MF_UNCHECKED));
+            return 0;
+        }
         case IDM_UNDO: Scim<void>(SCI_UNDO); return 0;
         case IDM_REDO: Scim<void>(SCI_REDO); return 0;
         case IDM_CUT: Scim<void>(SCI_CUT); return 0;
@@ -1125,6 +1527,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 ShowError(L"\u89e3\u9664\u6587\u4ef6\u5173\u8054\u5931\u8d25\uff1a", kProgId);
             return 0;
         }
+        default:
+            // V5: recent-files items (dynamic IDs)
+            if (LOWORD(wParam) >= IDM_MRU_BASE &&
+                LOWORD(wParam) < IDM_MRU_BASE + 8) {
+                int idx = LOWORD(wParam) - IDM_MRU_BASE;
+                if (idx < g_mruCount && !g_mru[idx].empty()) {
+                    std::wstring p = g_mru[idx];
+                    if (PromptSaveIfDirty()) LoadFile(p);
+                }
+                return 0;
+            }
+            break;
         }
         break;
     }
@@ -1308,7 +1722,12 @@ static bool RunSelftest() {
     std::wstring resultPath = base + L"\\selftest-result.txt";
     FILE *rf = _wfopen(resultPath.c_str(), L"wb, ccs=UTF-8");
     int pass = 0;
-    int total = (int)cases.size() + 1;  // +1 assoc-reg case appended below
+    // +1 assoc-reg case +1 format-validate case (both appended below).
+    // Suppress MRU writes during selftest so temporary .dat files never leak
+    // into the real recent-files list.
+    bool mruWasEnabled = g_mruSuppress;
+    g_mruSuppress = true;
+    int total = (int)cases.size() + 2;
     for (size_t i = 0; i < cases.size(); ++i) {
         const TestCase &c = cases[i];
         std::wstring in = base + L"\\in_" + std::to_wstring(i) + L".dat";
@@ -1403,6 +1822,34 @@ static bool RunSelftest() {
             if (sepPass) { --pass; sepPass = false; }
         }
     }
+
+    // 10. format-validate: pure ValidateFormat checks (no dialogs, no files)
+    {
+        std::wstring err;
+        int line = -1;
+        // valid JSON must pass
+        Scim<void>(SCI_SETTEXT, 0, (sptr_t)"{\"a\":1,\"b\":[1,2]}");
+        g_filePath = L"selftest.json";
+        bool okValid = ValidateFormat(err, line);
+        // broken JSON must fail with a line number
+        Scim<void>(SCI_SETTEXT, 0, (sptr_t)"{\"a\":");
+        bool okBroken = !ValidateFormat(err, line) && line > 0;
+        // broken XML must fail too
+        Scim<void>(SCI_SETTEXT, 0, (sptr_t)"<root><item></root>");
+        g_filePath = L"selftest.xml";
+        bool okXml = !ValidateFormat(err, line) && line > 0;
+        bool vpass = okValid && okBroken && okXml;
+        if (vpass) ++pass;
+        char line2[200];
+        sprintf_s(line2, sizeof(line2),
+            "format-validate: %s (valid=%d broken=%d xml=%d)\r\n",
+            vpass ? "PASS" : "FAIL", okValid ? 1 : 0, okBroken ? 1 : 0, okXml ? 1 : 0);
+        LogLine(rf, line2);
+        // restore selftest environment
+        g_filePath.clear();
+        g_mruSuppress = mruWasEnabled;
+        Scim<void>(SCI_SETTEXT, 0, (sptr_t)"");
+    }
     if (rf) {
         char sum[128];
         sprintf_s(sum, sizeof(sum), "TOTAL %d/%d %s\r\n",
@@ -1477,6 +1924,10 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmdLineIn, int nShow) {
     // menu
     HMENU menu = CreateMenu();
     HMENU mFile = CreatePopupMenu();
+    HMENU mRecent = CreatePopupMenu();     // populated on WM_INITMENUPOPUP
+    g_mRecentMenu = mRecent;
+    AppendMenuW(mFile, MF_POPUP, (UINT_PTR)mRecent, L"\u6700\u8fd1\u6253\u5f00(&R)");
+    AppendMenuW(mFile, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(mFile, MF_STRING, IDM_OPEN,  L"\u6253\u5f00(&O)\tCtrl+O");
     AppendMenuW(mFile, MF_STRING, IDM_SAVE,  L"\u4fdd\u5b58(&S)\tCtrl+S");
     AppendMenuW(mFile, MF_STRING, IDM_SAVEAS, L"\u53e6\u5b58\u4e3a(&A)...");
@@ -1491,9 +1942,21 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmdLineIn, int nShow) {
     AppendMenuW(mEdit, MF_STRING, IDM_PASTE, L"\u7c98\u8d34(&P)\tCtrl+V");
     AppendMenuW(mEdit, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(mEdit, MF_STRING, IDM_SELECTALL, L"\u5168\u9009(&A)\tCtrl+A");
+    AppendMenuW(mEdit, MF_SEPARATOR, 0, nullptr);
+    HMENU mReload = CreatePopupMenu();
+    AppendMenuW(mReload, MF_STRING, IDM_RELOAD_UTF8, L"UTF-8(&8)");
+    AppendMenuW(mReload, MF_STRING, IDM_RELOAD_GBK, L"GBK (ANSI)(&G)");
+    AppendMenuW(mReload, MF_STRING, IDM_RELOAD_UTF16, L"UTF-16LE(&1)");
+    AppendMenuW(mEdit, MF_POPUP, (UINT_PTR)mReload, L"\u6309\u5176\u4ed6\u7f16\u7801\u91cd\u65b0\u52a0\u8f7d(&R)");
     HMENU mSearch = CreatePopupMenu();
     AppendMenuW(mSearch, MF_STRING, IDM_FIND, L"\u67e5\u627e(&F)...\tCtrl+F");
     AppendMenuW(mSearch, MF_STRING, IDM_FINDNEXT, L"\u67e5\u627e\u4e0b\u4e00\u4e2a\tF3");
+    HMENU mView = CreatePopupMenu();
+    AppendMenuW(mView, MF_STRING, IDM_VIEW_EOL, L"\u663e\u793a\u884c\u5c3e\u7b26(&E)");
+    AppendMenuW(mView, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(mView, MF_STRING, IDM_ZOOM_IN, L"\u653e\u5927\u5b57\u53f7(&I)\tCtrl++");
+    AppendMenuW(mView, MF_STRING, IDM_ZOOM_OUT, L"\u7f29\u5c0f\u5b57\u53f7(&O)\tCtrl+-");
+    AppendMenuW(mView, MF_STRING, IDM_ZOOM_RESET, L"\u91cd\u7f6e\u5b57\u53f7(&0)\tCtrl+0");
     HMENU mHelp = CreatePopupMenu();
     AppendMenuW(mHelp, MF_STRING, IDM_REGASSOC, L"\u8bbe\u4e3a\u9ed8\u8ba4\u6253\u5f00\u65b9\u5f0f(&D)");
     AppendMenuW(mHelp, MF_STRING, IDM_UNREGASSOC, L"\u89e3\u9664\u6587\u4ef6\u5173\u8054(&U)");
@@ -1502,6 +1965,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmdLineIn, int nShow) {
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)mFile, L"\u6587\u4ef6(&F)");
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)mEdit, L"\u7f16\u8f91(&E)");
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)mSearch, L"\u641c\u7d22(&S)");
+    AppendMenuW(menu, MF_POPUP, (UINT_PTR)mView, L"\u67e5\u770b(&V)");
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)mHelp, L"\u5e2e\u52a9(&H)");
     SetMenu(hwnd, menu);
     DrawMenuBar(hwnd);
@@ -1514,8 +1978,11 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmdLineIn, int nShow) {
         { FVIRTKEY, VK_F3, IDM_FINDNEXT },
         { FCONTROL | FVIRTKEY, 'Z', IDM_UNDO },
         { FCONTROL | FVIRTKEY, 'Y', IDM_REDO },
+        { FCONTROL | FVIRTKEY, VK_OEM_PLUS, IDM_ZOOM_IN },
+        { FCONTROL | FVIRTKEY, VK_OEM_MINUS, IDM_ZOOM_OUT },
+        { FCONTROL | FVIRTKEY, '0', IDM_ZOOM_RESET },
     };
-    HACCEL hAcc = CreateAcceleratorTableW(acc, 6);
+    HACCEL hAcc = CreateAcceleratorTableW(acc, 9);
 
     if (selftest) {
         ShowWindow(hwnd, SW_HIDE);
@@ -1527,6 +1994,9 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmdLineIn, int nShow) {
         bool ok = RunUiCheck(hwnd, openFile);
         return ok ? 0 : 1;
     }
+    // V5: recent-files cache + view menu checkmark (GUI path only)
+    LoadMru();
+    CheckMenuItem(menu, IDM_VIEW_EOL, MF_BYCOMMAND | MF_CHECKED);
 
     if (!openFile.empty()) LoadFile(openFile);
 
