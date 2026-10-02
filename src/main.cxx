@@ -805,6 +805,34 @@ static bool PromptSaveIfDirty() {
 // ---------------------------------------------------------------------------
 // Open / Save As dialogs
 
+// Filter string generated from the extension map so it can never drift:
+// "label\0patterns\0\0" style groups GetOpenFileNameW accepts.
+static std::wstring BuildOpenFilter() {
+    // groups ordered by frequency of use in intranet config work
+    struct Group { const wchar_t *label; const wchar_t *exts; };
+    static const Group groups[] = {
+        { L"\u914d\u7f6e\u6587\u4ef6 (*.ini;*.cfg;*.conf;*.properties;*.env)",
+          L"*.ini;*.cfg;*.conf;*.properties;*.env" },
+        { L"\u6570\u636e\u6587\u4ef6 (*.json;*.xml;*.yaml;*.yml)",
+          L"*.json;*.xml;*.yaml;*.yml" },
+        { L"\u7f51\u9875 (*.html;*.htm;*.css;*.js)", L"*.html;*.htm;*.css;*.js" },
+        { L"\u811a\u672c (*.py;*.sql;*.bat;*.cmd;*.sh)", L"*.py;*.sql;*.bat;*.cmd;*.sh" },
+        { L"C/C++/Java/C# (*.c;*.cpp;*.h;*.hpp;*.cc;*.cxx;*.java;*.cs;*.mjs)",
+          L"*.c;*.cpp;*.h;*.hpp;*.cc;*.cxx;*.java;*.cs;*.mjs" },
+        { L"\u6587\u672c (*.txt;*.log)", L"*.txt;*.log" },
+        { L"\u6240\u6709\u6587\u4ef6 (*.*)", L"*.*" },
+    };
+    std::wstring s;
+    for (int i = 0; i < 7; ++i) {
+        s += groups[i].label; s += L'\0';
+        s += groups[i].exts;  s += L'\0';
+    }
+    s += L'\0';  // filter list terminator
+    return s;
+}
+
+static std::wstring g_openFilter = BuildOpenFilter();
+
 static void DoOpenDlg() {
     if (!PromptSaveIfDirty()) return;
     wchar_t file[MAX_PATH * 4] = L"";
@@ -812,10 +840,7 @@ static void DoOpenDlg() {
     ZeroMemory(&ofn, sizeof(ofn));
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = g_hwnd;
-    ofn.lpstrFilter =
-        L"\u652f\u6301\u7684\u6587\u4ef6 (*.ini;*.cfg;*.conf;*.json;*.xml;*.yaml)\0"
-        L"*.ini;*.cfg;*.conf;*.json;*.xml;*.yaml;*.yml;*.sql;*.py;*.js;*.html;*.bat\0"
-        L"\u6240\u6709\u6587\u4ef6\0*.*\0";
+    ofn.lpstrFilter = g_openFilter.c_str();
     ofn.lpstrFile = file;
     ofn.nMaxFile = MAX_PATH * 4;
     ofn.lpstrTitle = L"\u6253\u5f00";
@@ -831,7 +856,16 @@ static bool DoSaveAsDlg() {
     ZeroMemory(&ofn, sizeof(ofn));
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = g_hwnd;
-    ofn.lpstrFilter = L"\u6240\u6709\u6587\u4ef6\0*.*\0";
+    // default to the current file's own type
+    ofn.lpstrFilter =
+        L"\u914d\u7f6e\u6587\u4ef6 (*.ini)\0*.ini;*.cfg;*.conf;*.properties;*.env\0"
+        L"\u6570\u636e\u6587\u4ef6\0*.json;*.xml;*.yaml;*.yml\0"
+        L"\u7f51\u9875\u6587\u4ef6\0*.html;*.htm;*.css;*.js\0"
+        L"\u811a\u672c\u6587\u4ef6\0*.py;*.sql;*.bat;*.cmd;*.sh\0"
+        L"C/C++/Java/C#\0*.c;*.cpp;*.h;*.hpp;*.cc;*.cxx;*.java;*.cs;*.mjs\0"
+        L"\u6587\u672c (*.txt;*.log)\0*.txt;*.log\0"
+        L"\u6240\u6709\u6587\u4ef6 (*.*)\0*.*\0";
+    ofn.nFilterIndex = 1;  // user picks; no auto-magic
     ofn.lpstrFile = file;
     ofn.nMaxFile = MAX_PATH * 4;
     ofn.lpstrTitle = L"\u53e6\u5b58\u4e3a";
