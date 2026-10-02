@@ -14,6 +14,7 @@
 #include "Scintilla.h"
 #include "ILexer.h"
 #include "Lexilla.h"
+#include "SciLexer.h"
 
 extern "C" int Scintilla_RegisterClasses(void *hInstance);
 
@@ -520,19 +521,161 @@ static bool LoadFile(const std::wstring &path, bool attachLexer = true) {
     Scim<void>(SCI_STYLESETSIZE, STYLE_DEFAULT, 11);
     Scim<void>(SCI_STYLESETCHARACTERSET, STYLE_DEFAULT,
         (sptr_t)(mode == MODE_ANSI ? SC_CHARSET_GB2312 : SC_CHARSET_ANSI));
+    // dark theme defaults (STYLECLEARALL copies default into every style slot)
+    Scim<void>(SCI_STYLESETBACK, STYLE_DEFAULT, 0x1E1E1E);  // #1E1E1E editor bg
+    Scim<void>(SCI_STYLESETFORE, STYLE_DEFAULT, 0xD4D4D4);  // #D4D4D4 default fg
     Scim<void>(SCI_STYLECLEARALL);
     Scim<void>(SCI_SETTABWIDTH, 4);
     Scim<void>(SCI_SETMARGINTYPEN, 0, SC_MARGIN_NUMBER);
     Scim<int>(SCI_SETMARGINWIDTHN, 0,
         Scim<int>(SCI_TEXTWIDTH, STYLE_LINENUMBER, (sptr_t)"99999"));
+    // line-number gutter: dark bg, dim gray numerals
+    Scim<void>(SCI_SETMARGINBACKN, 0, 0x252526);
+    Scim<void>(SCI_STYLESETBACK, STYLE_LINENUMBER, 0x252526);
+    Scim<void>(SCI_STYLESETFORE, STYLE_LINENUMBER, 0x858585);
 
+    // fold margin (margin 1) + markers are configured once in WM_CREATE
+    // (static control settings, not file state).
+
+    const char *lexer = nullptr;
     if (attachLexer) {
-        const char *lexer = LexerForExt(ExtOf(path));
+        lexer = LexerForExt(ExtOf(path));
         if (lexer) {
             ILexer5 *il = CreateLexer(lexer);
-            if (il) Scim<void>(SCI_SETILEXER, 0, (sptr_t)il);
+            if (il) {
+                Scim<void>(SCI_SETILEXER, 0, (sptr_t)il);
+                // dark-theme per-lexer token colours (VS Code Dark+ palette).
+                // wParam = style number from SciLexer.h, lParam = COLORREF.
+                #define TCOL(n, rgb) Scim<void>(SCI_STYLESETFORE, (uptr_t)(n), (sptr_t)(rgb))
+                const int cComment = 0x6A9955, cKeyword = 0x569CD6,
+                    cString = 0xCE9178, cNumber = 0xB5CEA8,
+                    cAttr = 0x9CDCFE, cError = 0xF44747;
+                if (!strcmp(lexer, "props")) {
+                    TCOL(SCE_PROPS_COMMENT, cComment);
+                    TCOL(SCE_PROPS_SECTION, cKeyword);
+                    TCOL(SCE_PROPS_ASSIGNMENT, cAttr);
+                    TCOL(SCE_PROPS_DEFVAL, cString);
+                    TCOL(SCE_PROPS_KEY, cAttr);       Scim<void>(SCI_STYLESETBOLD, SCE_PROPS_KEY, 1);
+                } else if (!strcmp(lexer, "conf")) {
+                    TCOL(SCE_CONF_COMMENT, cComment);
+                    TCOL(SCE_CONF_EXTENSION, cAttr);
+                    TCOL(SCE_CONF_STRING, cString);
+                    TCOL(SCE_CONF_PARAMETER, cAttr);   Scim<void>(SCI_STYLESETBOLD, SCE_CONF_PARAMETER, 1);
+                    TCOL(SCE_CONF_DIRECTIVE, cKeyword);
+                    TCOL(SCE_CONF_IP, cNumber);
+                } else if (!strcmp(lexer, "json")) {
+                    TCOL(SCE_JSON_NUMBER, cNumber);
+                    TCOL(SCE_JSON_STRING, cString);
+                    TCOL(SCE_JSON_PROPERTYNAME, cAttr); Scim<void>(SCI_STYLESETBOLD, SCE_JSON_PROPERTYNAME, 1);
+                    TCOL(SCE_JSON_LINECOMMENT, cComment);
+                    TCOL(SCE_JSON_BLOCKCOMMENT, cComment);
+                    TCOL(SCE_JSON_OPERATOR, 0xD4D4D4);
+                    TCOL(SCE_JSON_KEYWORD, cKeyword);   Scim<void>(SCI_STYLESETBOLD, SCE_JSON_KEYWORD, 1);
+                    TCOL(SCE_JSON_ERROR, cError);
+                } else if (!strcmp(lexer, "xml")) {
+                    TCOL(SCE_H_TAG, cKeyword);
+                    TCOL(SCE_H_ATTRIBUTE, cAttr);
+                    TCOL(SCE_H_NUMBER, cNumber);
+                    TCOL(SCE_H_DOUBLESTRING, cString);
+                    TCOL(SCE_H_SINGLESTRING, cString);
+                    TCOL(SCE_H_COMMENT, cComment);
+                    TCOL(SCE_H_ENTITY, cNumber);
+                    TCOL(SCE_H_VALUE, cString);
+                    TCOL(SCE_H_XCCOMMENT, cComment);
+                } else if (!strcmp(lexer, "html")) {
+                    TCOL(SCE_H_TAG, cKeyword);
+                    TCOL(SCE_H_ATTRIBUTE, cAttr);
+                    TCOL(SCE_H_NUMBER, cNumber);
+                    TCOL(SCE_H_DOUBLESTRING, cString);
+                    TCOL(SCE_H_SINGLESTRING, cString);
+                    TCOL(SCE_H_COMMENT, cComment);
+                    TCOL(SCE_H_ENTITY, cNumber);
+                    TCOL(SCE_H_VALUE, cString);
+                } else if (!strcmp(lexer, "yaml")) {
+                    TCOL(SCE_YAML_COMMENT, cComment);
+                    TCOL(SCE_YAML_IDENTIFIER, cAttr);
+                    TCOL(SCE_YAML_KEYWORD, cKeyword);   Scim<void>(SCI_STYLESETBOLD, SCE_YAML_KEYWORD, 1);
+                    TCOL(SCE_YAML_NUMBER, cNumber);
+                    TCOL(SCE_YAML_DOCUMENT, 0xC586C0);  Scim<void>(SCI_STYLESETBOLD, SCE_YAML_DOCUMENT, 1);
+                    TCOL(SCE_YAML_REFERENCE, 0x4EC9B0);
+                    TCOL(SCE_YAML_OPERATOR, 0xD4D4D4);
+                } else if (!strcmp(lexer, "sql")) {
+                    TCOL(SCE_SQL_COMMENT, cComment);
+                    TCOL(SCE_SQL_COMMENTLINE, cComment);
+                    TCOL(SCE_SQL_NUMBER, cNumber);
+                    TCOL(SCE_SQL_WORD, cKeyword);       Scim<void>(SCI_STYLESETBOLD, SCE_SQL_WORD, 1);
+                    TCOL(SCE_SQL_WORD2, 0x4EC9B0);
+                    TCOL(SCE_SQL_STRING, cString);
+                    TCOL(SCE_SQL_OPERATOR, 0xD4D4D4);
+                    TCOL(SCE_SQL_QUOTEDIDENTIFIER, cAttr);
+                } else if (!strcmp(lexer, "batch")) {
+                    TCOL(SCE_BAT_COMMENT, cComment);
+                    TCOL(SCE_BAT_WORD, cKeyword);
+                    TCOL(SCE_BAT_LABEL, 0xDCDCAA);
+                    TCOL(SCE_BAT_COMMAND, 0xDCDCAA);
+                    TCOL(SCE_BAT_OPERATOR, 0xD4D4D4);
+                } else if (!strcmp(lexer, "cpp")) {
+                    TCOL(SCE_C_COMMENT, cComment);
+                    TCOL(SCE_C_COMMENTLINE, cComment);
+                    TCOL(SCE_C_NUMBER, cNumber);
+                    TCOL(SCE_C_WORD, cKeyword);         Scim<void>(SCI_STYLESETBOLD, SCE_C_WORD, 1);
+                    TCOL(SCE_C_WORD2, 0x4EC9B0);
+                    TCOL(SCE_C_STRING, cString);
+                    TCOL(SCE_C_CHARACTER, cString);
+                    TCOL(SCE_C_PREPROCESSOR, 0xC586C0);
+                    TCOL(SCE_C_OPERATOR, 0xD4D4D4);
+                    TCOL(SCE_C_GLOBALCLASS, 0x4EC9B0);
+                    TCOL(SCE_C_STRINGRAW, cString);
+                    TCOL(SCE_C_ESCAPESEQUENCE, cNumber);
+                } else if (!strcmp(lexer, "css")) {
+                    TCOL(SCE_CSS_TAG, 0xD7BA7D);
+                    TCOL(SCE_CSS_CLASS, cAttr);
+                    TCOL(SCE_CSS_PSEUDOCLASS, 0x4EC9B0);
+                    TCOL(SCE_CSS_IDENTIFIER, 0xD4D4D4);
+                    TCOL(SCE_CSS_VALUE, cString);
+                    TCOL(SCE_CSS_COMMENT, cComment);
+                    TCOL(SCE_CSS_ID, 0x4EC9B0);
+                    TCOL(SCE_CSS_IMPORTANT, 0xC586C0);
+                    TCOL(SCE_CSS_DIRECTIVE, cKeyword);
+                    TCOL(SCE_CSS_DOUBLESTRING, cString);
+                    TCOL(SCE_CSS_SINGLESTRING, cString);
+                    TCOL(SCE_CSS_VARIABLE, cAttr);
+                } else if (!strcmp(lexer, "python")) {
+                    TCOL(SCE_P_COMMENTLINE, cComment);
+                    TCOL(SCE_P_NUMBER, cNumber);
+                    TCOL(SCE_P_STRING, cString);
+                    TCOL(SCE_P_CHARACTER, cString);
+                    TCOL(SCE_P_WORD, 0xC586C0);
+                    TCOL(SCE_P_TRIPLE, cString);
+                    TCOL(SCE_P_TRIPLEDOUBLE, cString);
+                    TCOL(SCE_P_CLASSNAME, 0x4EC9B0);
+                    TCOL(SCE_P_DEFNAME, 0xDCDCAA);
+                    TCOL(SCE_P_OPERATOR, 0xD4D4D4);
+                    TCOL(SCE_P_COMMENTBLOCK, cComment);
+                    TCOL(SCE_P_DECORATOR, 0xDCDCAA);
+                    TCOL(SCE_P_FSTRING, cString);
+                } else if (!strcmp(lexer, "bash")) {
+                    TCOL(SCE_SH_COMMENTLINE, cComment);
+                    TCOL(SCE_SH_NUMBER, cNumber);
+                    TCOL(SCE_SH_WORD, cKeyword);
+                    TCOL(SCE_SH_STRING, cString);
+                    TCOL(SCE_SH_CHARACTER, cString);
+                    TCOL(SCE_SH_OPERATOR, 0xD4D4D4);
+                    TCOL(SCE_SH_IDENTIFIER, 0xD4D4D4);
+                    TCOL(SCE_SH_SCALAR, cAttr);
+                    TCOL(SCE_SH_PARAM, cAttr);
+                    TCOL(SCE_SH_BACKTICKS, cString);
+                }
+                #undef TCOL
+            }
         }
     }
+    // framework elements (caret line, selection, caret)
+    Scim<void>(SCI_SETCARETLINEVISIBLE, 1);
+    Scim<void>(SCI_SETCARETLINEBACK, 0x264F78);
+    Scim<void>(SCI_SETELEMENTCOLOUR, SC_ELEMENT_CARET, 0xFFAEAFAD);
+    Scim<void>(SCI_SETELEMENTCOLOUR, SC_ELEMENT_CARET_LINE_BACK, 0x40264F78);
+    Scim<void>(SCI_SETSELBACK, 1, 0x264F78);
 
     Scim<void>(SCI_SETSAVEPOINT);
     Scim<void>(SCI_EMPTYUNDOBUFFER);
@@ -564,6 +707,12 @@ static void UpdateTitle() {
     t += L" - ";
     t += kAppTitle;
     SetWindowTextW(g_hwnd, t.c_str());
+    // status part 2: modified marker
+    if (g_status) {
+        const wchar_t *m = Scim<int>(SCI_GETMODIFY, 0, 0)
+            ? L"\u25cf \u5df2\u4fee\u6539" : L"\u5c31\u7eea";
+        SendMessageW(g_status, SB_SETTEXTW, 2, (LPARAM)m);
+    }
 }
 
 static void UpdateStatusPos() {
@@ -819,8 +968,34 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_sci = CreateWindowExW(0, L"Scintilla", L"",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPCHILDREN,
             0, 0, 300, 200, hwnd, nullptr, g_hInst, nullptr);
-        int parts[2] = { 220, -1 };
-        SendMessageW(g_status, SB_SETPARTS, 2, (LPARAM)parts);
+        int parts[3] = { 220, 370, -1 };
+        SendMessageW(g_status, SB_SETPARTS, 3, (LPARAM)parts);
+        // one-time Scintilla control setup (independent of which file loads)
+        {
+            // per-type colours / fonts / codepages are per-file in LoadFile;
+            // here only control-level static settings.
+            Scim<void>(SCI_SETPROPERTY, (uptr_t)"fold", (sptr_t)"1");
+            Scim<void>(SCI_SETMARGINTYPEN, 1, SC_MARGIN_SYMBOL);
+            Scim<void>(SCI_SETMARGINWIDTHN, 1, 14);
+            Scim<void>(SCI_SETMARGINMASKN, 1, (sptr_t)0xFE000000);
+            Scim<void>(SCI_SETMARGINSENSITIVEN, 1, TRUE);
+            Scim<void>(SCI_SETFOLDMARGINCOLOUR, 1, 0x252526);
+            Scim<void>(SCI_SETFOLDMARGINHICOLOUR, 1, 0x252526);
+            struct { int num; int shape; } tree[] = {
+                { SC_MARKNUM_FOLDEROPEN,      SC_MARK_BOXMINUS },
+                { SC_MARKNUM_FOLDER,          SC_MARK_BOXPLUS },
+                { SC_MARKNUM_FOLDEROPENMID,   SC_MARK_BOXPLUSCONNECTED },
+                { SC_MARKNUM_FOLDEREND,       SC_MARK_BOXMINUSCONNECTED },
+                { SC_MARKNUM_FOLDERSUB,       SC_MARK_VLINE },
+                { SC_MARKNUM_FOLDERTAIL,      SC_MARK_LCORNER },
+                { SC_MARKNUM_FOLDERMIDTAIL,   SC_MARK_TCORNER },
+            };
+            for (int i = 0; i < 7; ++i) {
+                Scim<void>(SCI_MARKERDEFINE, (uptr_t)tree[i].num, (sptr_t)tree[i].shape);
+                Scim<void>(SCI_MARKERSETFORE, (uptr_t)tree[i].num, 0xE7E7E7);
+                Scim<void>(SCI_MARKERSETBACK, (uptr_t)tree[i].num, 0x3A3D41);
+            }
+        }
         DragAcceptFiles(hwnd, TRUE);
         SendMessageW(hwnd, WM_APP_TITLE, 0, 0);
         return 0;
@@ -853,6 +1028,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             case SCN_SAVEPOINTREACHED:
             case SCN_SAVEPOINTLEFT:
                 UpdateTitle();
+                break;
+            case SCN_MARGINCLICK:
+                if (sc->margin == 1) {
+                    int line = (int)Scim<sptr_t>(SCI_LINEFROMPOSITION,
+                        (uptr_t)sc->position, 0);
+                    Scim<void>(SCI_TOGGLEFOLD, (uptr_t)line, 0);
+                }
                 break;
             case SCN_UPDATEUI:
                 UpdateStatusPos();
@@ -955,6 +1137,35 @@ static bool RunUiCheck(HWND hwnd, const std::wstring &openFile) {
         for (int i = 0; i < lstrlenW(status); ++i)
             fwprintf(f, L"%02X%02X", (unsigned)(status[i] & 0xFF), (unsigned)((status[i] >> 8) & 0xFF));
         fwprintf(f, L"\n");
+
+        // V4: prove syntax highlighting is live (JSON lexer attached, token
+        // styled) and fold levels produced.
+        int styleAt = -1, foldLine0 = 0, styleFore = 0;
+        if (loaded && !openFile.empty()) {
+            // lexer evidence: folded entry says json lexer ran
+            foldLine0 = (int)Scim<sptr_t>(SCI_GETFOLDLEVEL, 0, 0);
+            // force full-document styling (idle styling may not have run yet)
+            Scim<void>(SCI_COLOURISE, 0, (sptr_t)-1);
+            const char *probe = "value";   // string content in the doc
+            Scim<void>(SCI_SETTARGETSTART, 0);
+            Scim<void>(SCI_SETTARGETEND, Scim<int>(SCI_GETTEXTLENGTH));
+            int pos = Scim<int>(SCI_SEARCHINTARGET, (uptr_t)strlen(probe),
+                (sptr_t)probe);
+            if (pos >= 0) {
+                styleAt = (int)Scim<sptr_t>(SCI_GETSTYLEAT, (uptr_t)pos);
+                styleFore = Scim<int>(SCI_STYLEGETFORE, (uptr_t)styleAt, 0);
+                int styleBack = Scim<int>(SCI_STYLEGETBACK, (uptr_t)styleAt, 0);
+                if (styleBack != 0x1E1E1E) frameOk = false;
+            } else {
+                frameOk = false;
+            }
+        }
+        fwprintf(f, L"pos0_style=%d style_at_value=%d fore=0x%06X fold_level_0=0x%X\n",
+            (int)Scim<sptr_t>(SCI_GETSTYLEAT, 0, 0), styleAt,
+            (unsigned)styleFore, (unsigned)foldLine0);
+        // "value" content bytes inside a JSON string are SCE_JSON_STRING(2)
+        if (styleAt != 2) frameOk = false;
+        if (!(foldLine0 & 0x400)) frameOk = false;
         fclose(f);
     }
     return frameOk && sciOk && loaded;
@@ -1217,9 +1428,10 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmdLineIn, int nShow) {
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInst;
-    wc.hIcon = LoadIconW(nullptr, (LPCWSTR)IDI_APPLICATION);
+    wc.hIcon = LoadIconW(hInst, MAKEINTRESOURCEW(1));
+    wc.hIconSm = LoadIconW(hInst, MAKEINTRESOURCEW(1));
     wc.hCursor = LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
     wc.lpszClassName = kClassName;
     if (!RegisterClassExW(&wc)) return 2;
 
