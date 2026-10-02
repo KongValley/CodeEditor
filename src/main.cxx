@@ -495,6 +495,10 @@ static bool LoadFile(const std::wstring &path, bool attachLexer = true) {
 
     Scim<void>(SCI_SETCODEPAGE, (uptr_t)codepage);
     Scim<void>(SCI_SETPASTECONVERTENDINGS, 0, 0);   // never rewrite pasted EOLs
+    // Layout cache PAGE: only visible pages cache layout (less memory on large
+    // files than the document-wide default). Idle styling deliberately NOT
+    // set: measured to only defer (not remove) styling work.
+    Scim<void>(SCI_SETLAYOUTCACHE, (uptr_t)SC_CACHE_PAGE);            // page-only layout cache
     Scim<void>(SCI_SETEOLMODE, (uptr_t)g_eolMode);
     // The NUL-terminated style: Scintilla accepts C strings; embedded NULs are
     // handled by the SCI_SETTEXT variant below using explicit length.
@@ -1168,24 +1172,9 @@ static bool RunSelftest() {
 
 int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmdLineIn, int nShow) {
     g_hInst = hInst;
-    InitCommonControls();
 
-    Scintilla_RegisterClasses(hInst);
-    g_findReplMsg = RegisterWindowMessageW(FINDMSGSTRING);
-
-    // register the main window class (required before CreateWindowExW)
-    WNDCLASSEXW wc;
-    ZeroMemory(&wc, sizeof(wc));
-    wc.cbSize = sizeof(wc);
-    wc.lpfnWndProc = WndProc;
-    wc.hInstance = hInst;
-    wc.hIcon = LoadIconW(nullptr, (LPCWSTR)IDI_APPLICATION);
-    wc.hCursor = LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-    wc.lpszClassName = kClassName;
-    if (!RegisterClassExW(&wc)) return 2;
-
-    // parse --selftest before any window shows
+    // Parse args first: --register/--unregister must never touch Scintilla
+    // (shortest path, no window class registration, no CRT window setup).
     int argc = 0;
     LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (!argv) argv = CommandLineToArgvW(cmdLineIn, &argc);
@@ -1204,7 +1193,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmdLineIn, int nShow) {
     }
     LocalFree(argv);
 
-    // Silent association switches: no window, exit 0/1.
+    // Silent association switches: no Scintilla, no window, exit 0/1.
     if (regassoc || unregassoc) {
         bool ok = RegisterAssociations(regassoc);
         UINT icon = ok ? MB_ICONINFORMATION : MB_ICONERROR;
@@ -1216,6 +1205,23 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmdLineIn, int nShow) {
         MessageBoxW(nullptr, msg, kAppTitle, MB_OK | icon);
         return ok ? 0 : 1;
     }
+
+    InitCommonControls();
+
+    Scintilla_RegisterClasses(hInst);
+    g_findReplMsg = RegisterWindowMessageW(FINDMSGSTRING);
+
+    // register the main window class (required before CreateWindowExW)
+    WNDCLASSEXW wc;
+    ZeroMemory(&wc, sizeof(wc));
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = hInst;
+    wc.hIcon = LoadIconW(nullptr, (LPCWSTR)IDI_APPLICATION);
+    wc.hCursor = LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.lpszClassName = kClassName;
+    if (!RegisterClassExW(&wc)) return 2;
 
     HWND hwnd = CreateWindowExW(0, kClassName, kAppTitle, WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, 900, 650, nullptr, nullptr, hInst, nullptr);

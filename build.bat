@@ -85,13 +85,14 @@ echo [4/4] building application...
 "%BIN%\windres.exe" -O coff "%FARM%\res\app.rc" -o "%FARM%\build\app_res.o"
 if errorlevel 1 goto fail_rc
 
-"%BIN%\g++" -std=c++17 -O2 -municode -mwindows ^
+"%BIN%\g++" -std=c++17 -O2 -ffunction-sections -fdata-sections -municode -mwindows ^
   -I"%SC%\include" -I"%LEX%\include" ^
   "%FARM%\src\main.cxx" "%FARM%\build\app_res.o" ^
   "%SC%\bin\libscintilla.a" "%LEX%\bin\liblexilla.a" ^
   -lgdi32 -luser32 -limm32 -lole32 -loleaut32 -luuid -ladvapi32 ^
   -lcomdlg32 -lcomctl32 -lshell32 -lshlwapi ^
   -static -static-libgcc -static-libstdc++ ^
+  -Wl,--gc-sections -Wl,--exclude-all-symbols ^
   -o "%FARM%\dist\CodeEditor.exe"
 if errorlevel 1 goto fail_link
 
