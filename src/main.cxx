@@ -23,6 +23,7 @@ extern "C" int Scintilla_RegisterClasses(void *hInstance);
 
 static HINSTANCE g_hInst = nullptr;
 static HWND g_hwnd = nullptr, g_sci = nullptr, g_status = nullptr;
+static WNDPROC g_sciOldProc = nullptr;   // original Scintilla wndproc (drop forwarding)
 static HWND g_hwndFind = nullptr;
 static std::wstring g_filePath;
 static std::string g_findText;
@@ -170,6 +171,13 @@ static const char *LexerForExt(const std::wstring &ext) {
         if (ext == e->ext) return e->lexer;
     }
     return nullptr;
+}
+
+// "supported text" = highlighted formats (lexer table) plus plain .txt/.log,
+// which have no lexer by design. Single source: LexerForExt's own table.
+static bool IsTextExt(const std::wstring &ext) {
+    if (LexerForExt(ext)) return true;
+    return ext == L"txt" || ext == L"log";
 }
 
 // ---------------------------------------------------------------------------
@@ -1242,14 +1250,25 @@ static void AutoIndent(char ch) {
 // ---------------------------------------------------------------------------
 // Window proc
 
+// Scintilla covers the whole client area; without this subclass drops land on
+// it (no WS_EX_ACCEPTFILES forwarding) and never reach the main handler.
+static LRESULT CALLBACK ScintillaDropFwd(HWND h, UINT msg, WPARAM w, LPARAM l) {
+    if (msg == WM_DROPFILES && g_hwnd)
+        return SendMessageW(g_hwnd, msg, w, l);
+    return CallWindowProcW(g_sciOldProc, h, msg, w, l);
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE: {
         g_status = CreateStatusWindowW(WS_CHILD | WS_VISIBLE | CCS_BOTTOM,
             L"", hwnd, 5000);
-        g_sci = CreateWindowExW(0, L"Scintilla", L"",
+        g_sci = CreateWindowExW(WS_EX_ACCEPTFILES, L"Scintilla", L"",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPCHILDREN,
             0, 0, 300, 200, hwnd, nullptr, g_hInst, nullptr);
+        if (g_sci)
+            g_sciOldProc = (WNDPROC)SetWindowLongPtrW(g_sci, GWLP_WNDPROC,
+                (LONG_PTR)ScintillaDropFwd);
         int parts[3] = { 220, 370, -1 };
         SendMessageW(g_status, SB_SETPARTS, 3, (LPARAM)parts);
         // one-time Scintilla control setup (independent of which file loads)
@@ -1329,10 +1348,29 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_DROPFILES: {
         HDROP hd = (HDROP)wParam;
         wchar_t path[MAX_PATH * 4] = L"";
-        if (DragQueryFileW(hd, 0, path, MAX_PATH * 4) > 0) {
-            if (PromptSaveIfDirty()) LoadFile(path);
+        bool has = DragQueryFileW(hd, 0, path, MAX_PATH * 4) > 0;
+        DragFinish(hd);   // single release point, before any early return
+        if (!has) return 0;
+        DWORD attr = GetFileAttributesW(path);
+        if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+            AppMsgBox(hwnd,
+                L"\u4e0d\u80fd\u6253\u5f00\u6587\u4ef6\u5939\uff0c\u8bf7\u62d6\u5165\u5177\u4f53\u6587\u4ef6\u3002",
+                kAppTitle, MB_OK | MB_ICONINFORMATION);
+            return 0;
         }
-        DragFinish(hd);
+        std::wstring ext = ExtOf(path);
+        if (!IsTextExt(ext)) {
+            std::wstring msg = ext.empty()
+                ? L"\u8be5\u6587\u4ef6\u6ca1\u6709\u6269\u5c55\u540d\uff0c"
+                  L"\u53ef\u80fd\u4e0d\u662f\u6587\u672c\u683c\u5f0f\u3002"
+                  L"\u4ecd\u8981\u4f5c\u4e3a\u6587\u672c\u6253\u5f00\u5417\uff1f"
+                : L"\u6269\u5c55\u540d ." + ext + L" \u53ef\u80fd\u4e0d\u662f\u6587\u672c\u683c\u5f0f\u3002"
+                  L"\u4ecd\u8981\u4f5c\u4e3a\u6587\u672c\u6253\u5f00\u5417\uff1f";
+            if (AppMsgBox(hwnd, msg.c_str(), kAppTitle,
+                    MB_OKCANCEL | MB_ICONWARNING) != IDOK)
+                return 0;
+        }
+        if (PromptSaveIfDirty()) LoadFile(path);
         return 0;
     }
     case WM_APP_TITLE:
@@ -2037,6 +2075,55 @@ static bool RunUiTest(HWND hwnd) {
         if (PromptSaveIfDirty()) LoadFile(m2);
         SendMessageW(hwnd, WM_COMMAND, IDM_MRU_BASE + 1, 0);
         check("mru-click-loads", g_filePath == m2);
+    }
+
+    // --- 7b. drag-drop: child accepts drops, unsupported formats prompt first ---
+    {
+        bool parentStyle =
+            (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_ACCEPTFILES) != 0;
+        bool sciStyle =
+            (GetWindowLongPtrW(g_sci, GWL_EXSTYLE) & WS_EX_ACCEPTFILES) != 0;
+        check("drop-accept-style", parentStyle && sciStyle);
+
+        std::wstring png = base + L"\\shot.png";
+        WriteBytes(png, std::vector<char>{ 'D' });
+        std::string before = DocText();
+        size_t sz = sizeof(DROPFILES) + (png.size() + 2) * sizeof(wchar_t);
+        auto makeDrop = [&](void) -> HGLOBAL {
+            HGLOBAL hg = GlobalAlloc(GHND, sz);
+            DROPFILES *df = (DROPFILES *)GlobalLock(hg);
+            df->pFiles = (DWORD)sizeof(DROPFILES);
+            df->fWide = TRUE;
+            memcpy((BYTE *)df + sizeof(DROPFILES), png.c_str(),
+                png.size() * sizeof(wchar_t));
+            GlobalUnlock(hg);
+            return hg;
+        };
+        g_uiAnswer = IDCANCEL;
+        SendMessageW(hwnd, WM_DROPFILES, (WPARAM)makeDrop(), 0);
+        check("drop-unsupported-cancel-keeps",
+            DocText() == before && IsWindow(hwnd) != 0);
+        g_uiAnswer = IDOK;
+        SendMessageW(hwnd, WM_DROPFILES, (WPARAM)makeDrop(), 0);
+        bool loaded = g_filePath == png && DocText() == "D";
+        g_filePath.clear();
+        check("drop-unsupported-ok-loads", loaded);
+        g_uiAnswer = 0;
+
+        // folder drop: refused with notice, document untouched
+        std::wstring dir1 = base + L"\\dropdir";
+        CreateDirectoryW(dir1.c_str(), nullptr);
+        std::string before2 = DocText();
+        size_t sz2 = sizeof(DROPFILES) + (dir1.size() + 2) * sizeof(wchar_t);
+        HGLOBAL hg2 = GlobalAlloc(GHND, sz2);
+        DROPFILES *df2 = (DROPFILES *)GlobalLock(hg2);
+        df2->pFiles = (DWORD)sizeof(DROPFILES);
+        df2->fWide = TRUE;
+        memcpy((BYTE *)df2 + sizeof(DROPFILES), dir1.c_str(),
+            dir1.size() * sizeof(wchar_t));
+        GlobalUnlock(hg2);
+        SendMessageW(hwnd, WM_DROPFILES, (WPARAM)hg2, 0);
+        check("drop-dir-refused", DocText() == before2 && IsWindow(hwnd) != 0);
     }
 
     // --- 8b. pathological path through ShowError must not smash the stack ---
