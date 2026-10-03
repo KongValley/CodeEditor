@@ -34,10 +34,14 @@
 ## 自测
 
 ```
-CodeEditor.exe --selftest
+CodeEditor.exe --selftest   # 12 用例：字节级保持 + 备份 + 强制编码重载 + 注册表往返 + 格式校验
+CodeEditor.exe --uitest     # 26 用例：菜单命令/通知路径（缩放、行尾开关、编码重载、
+                            #   外部修改检测三态、保存校验弹窗两态、全部替换预警两态、
+                            #   最近文件菜单、关闭守卫、只读保存拦截），弹窗脚本化应答
+CodeEditor.exe --uicheck    # 窗口/Scintilla/着色/折叠链路（需指定一个含 "value" 的 json 文件）
 ```
 
-9 个用例：8 个字节级保持（UTF-8 BOM/无 BOM/GBK/UTF-16LE/BE/CR 行尾/嵌入 NUL/缩短回写/空文件）+ 1 个注册表关联往返（含“还原他人关联”断言，用替身 ProgID，不碰真实关联）。结果写 `%TEMP%\CodeEditorSelftest\selftest-result.txt`，退出码 0 = 全过。
+结果分别写 `%TEMP%\CodeEditorSelftest\selftest-result.txt`、`%TEMP%\CodeEditorUiTest\uitest-result.txt`、`C:\cedb\uicheck-result.txt`，退出码 0 = 全过。
 
 ## 构建
 

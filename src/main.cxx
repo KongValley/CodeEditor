@@ -55,6 +55,24 @@ static void SetStatusPart2(const wchar_t *s);
 static bool ValidateFormat(std::wstring &err, int &line);
 static void ApplyZoom(int delta);
 
+// --- scripted message box (--uitest) ---
+// Normal mode: straight to MessageBoxW. In uitest mode: log the call to
+// C:\cedb\uitest-result.txt and answer from a scripted queue so modal dialogs
+// never block automated runs.
+static bool g_uiTest = false;
+static int  g_uiAnswer = 0;          // 0 = default (OK/YES), else IDOK/IDCANCEL/...
+static FILE *g_uiTestLog = nullptr;
+
+static int AppMsgBox(HWND h, LPCWSTR text, LPCWSTR caption, UINT type) {
+    if (!g_uiTest) return MessageBoxW(h, text, caption, type);
+    if (g_uiTestLog) {
+        fwprintf(g_uiTestLog, L"[mbox] type=0x%X text=%ls\n", type, text);
+        fflush(g_uiTestLog);
+    }
+    if (g_uiAnswer) return g_uiAnswer;
+    return (type & MB_YESNO) ? IDYES : IDOK;
+}
+
 static const wchar_t *kClassName = L"IntranetEditorWnd";
 static const wchar_t *kAppTitle = L"\u4ee3\u7801\u7f16\u8f91\u5668";           // 代码编辑器
 static const int kMaxFileBytes = 256 * 1024 * 1024;
@@ -267,7 +285,7 @@ static void ShowError(const wchar_t *what, const std::wstring &path) {
     wchar_t msg[512];
     wsprintfW(msg, L"%s\n%s\n\n%s %lu: %s", what, path.c_str(),
         L"\u9519\u8bef\u4ee3\u7801", GetLastError(), ErrText(GetLastError()).c_str());
-    MessageBoxW(g_hwnd, msg, kAppTitle, MB_OK | MB_ICONERROR);
+    AppMsgBox(g_hwnd, msg, kAppTitle, MB_OK | MB_ICONERROR);
 }
 
 static std::wstring BaseName(const std::wstring &path) {
@@ -1032,8 +1050,12 @@ static bool SaveFile(const std::wstring &path) {
     bool exists = GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
     // automatic backup of the previous content before overwriting
     if (exists) {
+        // CopyFileW carries the source's READ-ONLY attribute onto the backup;
+        // a stale read-only .bak would then make every future refresh fail,
+        // so clear the attribute first (no-op when the file doesn't exist).
+        SetFileAttributesW((path + L".bak").c_str(), FILE_ATTRIBUTE_NORMAL);
         if (!CopyFileW(path.c_str(), (path + L".bak").c_str(), FALSE)) {
-            MessageBoxW(g_hwnd,
+            AppMsgBox(g_hwnd,
                 L"\u81ea\u52a8\u5907\u4efd\u5931\u8d25\uff08\u5c06\u7ee7\u7eed\u4fdd\u5b58\uff09\u3002",
                 kAppTitle, MB_OK | MB_ICONWARNING);
         }
@@ -1049,7 +1071,7 @@ static bool SaveFile(const std::wstring &path) {
     std::vector<char> out;
     if (!EncodeText(text, g_mode, g_bom, g_bomLen, out)) {
         CloseHandle(h);
-        MessageBoxW(g_hwnd, L"\u4fdd\u5b58\u5931\u8d25\uff1a\u7f16\u7801\u8f6c\u6362\u5f02\u5e38\u3002",
+        AppMsgBox(g_hwnd, L"\u4fdd\u5b58\u5931\u8d25\uff1a\u7f16\u7801\u8f6c\u6362\u5f02\u5e38\u3002",
             kAppTitle, MB_OK | MB_ICONERROR);
         return false;
     }
@@ -1078,7 +1100,7 @@ fail:
 // Returns false only when the user cancels.
 static bool PromptSaveIfDirty() {
     if (!Scim<int>(SCI_GETMODIFY, 0, 0)) return true;
-    int r = MessageBoxW(g_hwnd,
+    int r = AppMsgBox(g_hwnd,
         L"\u6587\u4ef6\u5df2\u4fee\u6539\uff0c\u662f\u5426\u4fdd\u5b58\uff1f", kAppTitle,
         MB_YESNOCANCEL | MB_ICONQUESTION);
     if (r == IDCANCEL) return false;
@@ -1213,36 +1235,44 @@ static void OnFindReplMessage(WPARAM wParam, LPARAM lParam) {
 
     bool doReplace = (fr->Flags & (FR_REPLACE | FR_REPLACEALL)) != 0;
     bool all = (fr->Flags & FR_REPLACEALL) != 0;
-    if (doReplace) {
+if (doReplace) {
         std::string rep = WideToUtf8(fr->lpstrReplaceWith);
         if (all) {
-            int total = CountMatches();
-            if (total == 0) {
+            // collect match positions first (forward scan), then replace from
+            // the end so earlier positions stay valid; finite and immune to
+            // self-matching replacements growing the document.
+            std::vector<sptr_t> hits;
+            {
+                Scim<void>(SCI_SETSEARCHFLAGS, g_findMatchCase ? SCFIND_MATCHCASE : 0);
+                sptr_t scan = 0;
+                sptr_t len = Scim<sptr_t>(SCI_GETLENGTH, 0, 0);
+                while (!g_findText.empty() && hits.size() < 9999 && scan <= len) {
+                    Scim<void>(SCI_SETTARGETSTART, (uptr_t)scan);
+                    Scim<void>(SCI_SETTARGETEND, (uptr_t)len);
+                    int pos = Scim<int>(SCI_SEARCHINTARGET, (uptr_t)g_findText.size(),
+                        (sptr_t)g_findText.c_str());
+                    if (pos < 0) break;
+                    hits.push_back((sptr_t)pos);
+                    scan = (sptr_t)pos + (sptr_t)g_findText.size();
+                }
+            }
+            if (hits.empty()) {
                 SetStatusPart2(L"\u65e0\u5339\u914d");
                 return;
             }
             wchar_t ask[128];
-            wsprintfW(ask, L"\u786e\u5b9a\u8981\u66ff\u6362\u5168\u90e8 %d \u5904\u5417\uff1f", total);
-            if (MessageBoxW(g_hwnd, ask, kAppTitle, MB_OKCANCEL | MB_ICONQUESTION) != IDOK)
+            wsprintfW(ask, L"\u786e\u5b9a\u8981\u66ff\u6362\u5168\u90e8 %d \u5904\u5417\uff1f",
+                (int)hits.size());
+            if (AppMsgBox(g_hwnd, ask, kAppTitle, MB_OKCANCEL | MB_ICONQUESTION) != IDOK)
                 return;
-            wchar_t done[64];
-            wsprintfW(done, L"\u5df2\u66ff\u6362 %d \u5904", total);
-            while (!g_findText.empty()) {
-                Scim<void>(SCI_SETSEARCHFLAGS, g_findMatchCase ? SCFIND_MATCHCASE : 0);
-                sptr_t from = Scim<sptr_t>(SCI_GETTARGETEND, 0, 0);
-                if (from <= 0) from = 0;
-                Scim<void>(SCI_SETTARGETSTART, (uptr_t)from);
-                Scim<void>(SCI_SETTARGETEND, (uptr_t)Scim<int>(SCI_GETLENGTH));
-                int pos = Scim<int>(SCI_SEARCHINTARGET, (uptr_t)g_findText.size(),
-                    (sptr_t)g_findText.c_str());
-                if (pos < 0) break;
-                Scim<void>(SCI_SETTARGETSTART, (uptr_t)pos);
-                Scim<void>(SCI_SETTARGETEND, (uptr_t)(pos + (int)g_findText.size()));
+            for (size_t i = hits.size(); i-- > 0; ) {
+                Scim<void>(SCI_SETTARGETSTART, (uptr_t)hits[i]);
+                Scim<void>(SCI_SETTARGETEND,
+                    (uptr_t)(hits[i] + (sptr_t)g_findText.size()));
                 Scim<void>(SCI_REPLACETARGET, (uptr_t)rep.size(), (sptr_t)rep.c_str());
-                // continue scanning after the replacement
-                Scim<void>(SCI_SETTARGETSTART, (uptr_t)(pos + (int)rep.size()));
-                Scim<void>(SCI_SETTARGETEND, (uptr_t)pos);
             }
+            wchar_t done[64];
+            wsprintfW(done, L"\u5df2\u66ff\u6362 %d \u5904", (int)hits.size());
             SetStatusPart2(done);
         } else if (fr->Flags & FR_REPLACE) {
             Scim<void>(SCI_TARGETFROMSELECTION);
@@ -1286,7 +1316,7 @@ static void FindNext(bool fromSelection) {
         if (n > 0) wsprintfW(s, L"\u5339\u914d %d \u5904", n);
         else wcscpy(s, L"\u65e0\u5339\u914d");
         SetStatusPart2(s);
-        MessageBoxW(g_hwnd, L"\u5df2\u5230\u6587\u4ef6\u672b\u5c3e\u3002", kAppTitle,
+        AppMsgBox(g_hwnd, L"\u5df2\u5230\u6587\u4ef6\u672b\u5c3e\u3002", kAppTitle,
             MB_OK | MB_ICONINFORMATION);
         return;
     }
@@ -1378,7 +1408,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (LOWORD(wParam) != WA_INACTIVE && g_fileTimeValid &&
             !g_filePath.empty() && FileWasModifiedExternally()) {
             if (Scim<int>(SCI_GETMODIFY, 0, 0)) {
-                int r = MessageBoxW(hwnd,
+                int r = AppMsgBox(hwnd,
                     L"\u6587\u4ef6\u5df2\u88ab\u5176\u4ed6\u7a0b\u5e8f\u4fee\u6539\uff0c"
                     L"\u662f\u5426\u91cd\u65b0\u52a0\u8f7d\uff1f",
                     kAppTitle, MB_YESNO | MB_ICONQUESTION);
@@ -1461,7 +1491,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     wsprintfW(ask,
                         L"\u7b2c %d \u884c\u53ef\u80fd\uff1a%s\u3002\u4ecd\u8981\u4fdd\u5b58\u5417\uff1f",
                         vline, verr.c_str());
-                    if (MessageBoxW(hwnd, ask, kAppTitle,
+                    if (AppMsgBox(hwnd, ask, kAppTitle,
                             MB_OKCANCEL | MB_ICONWARNING) != IDOK)
                         return 0;
                 }
@@ -1502,7 +1532,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case IDM_FIND: DoFind(); return 0;
         case IDM_FINDNEXT: FindNext(true); return 0;
         case IDM_ABOUT:
-            MessageBoxW(hwnd,
+            AppMsgBox(hwnd,
                 L"\u672c\u7f16\u8f91\u5668\u4fdd\u8bc1\uff1a\u6587\u4ef6\u7684\u7f16\u7801\u3001BOM\u3001"
                 L"\u6362\u884c\u7b26\u5728\u4fdd\u5b58\u540e\u4fdd\u6301\u539f\u6837\uff0c\u4e0d\u4f1a"
                 L"\u50cf\u8bb0\u4e8b\u672c\u4e00\u6837\u81ea\u52a8\u8f6c\u6362\u3002",
@@ -1510,20 +1540,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
         case IDM_REGASSOC:
             if (RegisterAssociations(true))
-                MessageBoxW(hwnd, L"\u5df2\u8bbe\u4e3a\u9ed8\u8ba4\u6253\u5f00\u65b9\u5f0f\uff08\u5305\u62ec .txt\u3001.ini\u3001"
+                AppMsgBox(hwnd, L"\u5df2\u8bbe\u4e3a\u9ed8\u8ba4\u6253\u5f00\u65b9\u5f0f\uff08\u5305\u62ec .txt\u3001.ini\u3001"
                     L".json \u7b49 29 \u79cd\u6587\u4ef6\u7c7b\u578b\uff09\u3002",
                     kAppTitle, MB_OK | MB_ICONINFORMATION);
             else
                 ShowError(L"\u6ce8\u518c\u6587\u4ef6\u5173\u8054\u5931\u8d25\uff1a", kProgId);
             return 0;
         case IDM_UNREGASSOC: {
-            int r = MessageBoxW(hwnd,
+            int r = AppMsgBox(hwnd,
                 L"\u5c06\u628a\u6587\u4ef6\u5173\u8054\u6062\u590d\u5230\u8bbe\u7f6e\u524d\u7684\u72b6\u6001\uff08\u5176\u4ed6"
                 L"\u7a0b\u5e8f\u7684\u5173\u8054\u4e0d\u53d7\u5f71\u54cd\uff09\u3002\u786e\u5b9a\u89e3\u9664\u5417\uff1f",
                 kAppTitle, MB_YESNO | MB_ICONQUESTION);
             if (r != IDYES) return 0;
             if (RegisterAssociations(false))
-                MessageBoxW(hwnd, L"\u5df2\u89e3\u9664\u6587\u4ef6\u5173\u8054\u3002",
+                AppMsgBox(hwnd, L"\u5df2\u89e3\u9664\u6587\u4ef6\u5173\u8054\u3002",
                     kAppTitle, MB_OK | MB_ICONINFORMATION);
             else
                 ShowError(L"\u89e3\u9664\u6587\u4ef6\u5173\u8054\u5931\u8d25\uff1a", kProgId);
@@ -1919,6 +1949,231 @@ static bool RunSelftest() {
 }
 
 // ---------------------------------------------------------------------------
+// Scripted UI-interaction test (--uitest). Drives the same WM_COMMAND /
+// notification paths the menus produce, with scripted dialog answers, and
+// asserts observable state after each step. No blocking dialogs, no desktop.
+
+static bool RunUiTest(HWND hwnd) {
+    wchar_t dir[MAX_PATH];
+    GetTempPathW(MAX_PATH, dir);
+    std::wstring base = dir;
+    base += L"CodeEditorUiTest";
+    CreateDirectoryW(base.c_str(), nullptr);
+
+    FILE *rf = _wfopen((base + L"\\uitest-result.txt").c_str(), L"w, ccs=UTF-8");
+    g_uiTestLog = rf;
+    int pass = 0, total = 0;
+    auto check = [&](const char *name, bool ok) {
+        ++total; if (ok) ++pass;
+        if (rf) { fwprintf(rf, L"%hs: %ls\r\n", name, ok ? L"PASS" : L"FAIL"); fflush(rf); }
+    };
+    auto part2 = [&](std::wstring &out) {
+        wchar_t b[128] = {0};
+        SendMessageW(g_status, SB_GETTEXTW, 2, (LPARAM)b);
+        out = b;
+    };
+    (void)part2;
+
+    bool mruWas = g_mruSuppress;
+    g_mruSuppress = true;   // LoadFile in tests must not touch the real MRU
+
+    // --- 1. zoom commands (menu path) + clamping ---
+    SendMessageW(hwnd, WM_COMMAND, IDM_ZOOM_RESET, 0);
+    SendMessageW(hwnd, WM_COMMAND, IDM_ZOOM_IN, 0);
+    SendMessageW(hwnd, WM_COMMAND, IDM_ZOOM_IN, 0);
+    check("zoom-in-2", Scim<int>(SCI_GETZOOM, 0, 0) == 2);
+    SendMessageW(hwnd, WM_COMMAND, IDM_ZOOM_OUT, 0);
+    check("zoom-out-1", Scim<int>(SCI_GETZOOM, 0, 0) == 1);
+    for (int i = 0; i < 40; ++i) SendMessageW(hwnd, WM_COMMAND, IDM_ZOOM_IN, 0);
+    check("zoom-clamp-20", Scim<int>(SCI_GETZOOM, 0, 0) == 20);
+    SendMessageW(hwnd, WM_COMMAND, IDM_ZOOM_RESET, 0);
+    check("zoom-reset-0", Scim<int>(SCI_GETZOOM, 0, 0) == 0);
+
+    // --- 2. EOL visibility toggle (menu path + check state) ---
+    {
+        UINT st0 = GetMenuState(GetMenu(hwnd), IDM_VIEW_EOL, MF_BYCOMMAND);
+        SendMessageW(hwnd, WM_COMMAND, IDM_VIEW_EOL, 0);
+        bool off = Scim<int>(SCI_GETVIEWEOL, 0, 0) == 0;
+        UINT st1 = GetMenuState(GetMenu(hwnd), IDM_VIEW_EOL, MF_BYCOMMAND);
+        bool unchecked = (st1 & MF_CHECKED) == 0;
+        SendMessageW(hwnd, WM_COMMAND, IDM_VIEW_EOL, 0);
+        bool on = Scim<int>(SCI_GETVIEWEOL, 0, 0) == 1;
+        UINT st2 = GetMenuState(GetMenu(hwnd), IDM_VIEW_EOL, MF_BYCOMMAND);
+        check("eol-toggle-off-on", off && unchecked && on && (st2 & MF_CHECKED));
+        (void)st0;
+    }
+
+    // --- 3. reload-as-encoding (menu path), incl. cancel-on-dirty ---
+    {
+        std::wstring gbk = base + L"\\reload_gbk.txt";
+        WriteBytes(gbk, std::vector<char>{ '\xd6', '\xd0', '\xce', '\xc4',
+            '\r', '\n' });
+        check("reload-initial", LoadFile(gbk) && g_mode == MODE_ANSI);
+        SendMessageW(hwnd, WM_COMMAND, IDM_RELOAD_UTF8, 0);
+        check("reload-as-utf8", g_mode == MODE_UTF8);
+        SendMessageW(hwnd, WM_COMMAND, IDM_RELOAD_GBK, 0);
+        check("reload-as-gbk", g_mode == MODE_ANSI);
+        SendMessageW(hwnd, WM_COMMAND, IDM_RELOAD_UTF16, 0);
+        check("reload-as-utf16", g_mode == MODE_UTF16LE);
+        // dirty + cancel must abort the reload
+        g_mode = MODE_ANSI;
+        Scim<void>(SCI_INSERTTEXT, 0, (sptr_t)"X");
+        g_uiAnswer = IDCANCEL;
+        SendMessageW(hwnd, WM_COMMAND, IDM_RELOAD_UTF8, 0);
+        check("reload-cancel-keeps-mode", g_mode == MODE_ANSI);
+        g_uiAnswer = 0;
+    }
+
+    // --- 4. external-change detection (WM_ACTIVATE path) ---
+    {
+        std::wstring ext = base + L"\\ext.dat";
+        WriteBytes(ext, std::vector<char>{ 'O', 'N', 'E' });
+        check("ext-load", LoadFile(ext));
+        Sleep(60);
+        WriteBytes(ext, std::vector<char>{ 'T', 'W', 'O' });
+        SendMessageW(hwnd, WM_ACTIVATE, MAKEWPARAM(WA_ACTIVE, 0), 0);
+        check("ext-silent-reload", DocText() == "TWO");
+        // local edit + external change + IDYES -> reload to disk content
+        Scim<void>(SCI_INSERTTEXT, 0, (sptr_t)"L");
+        Sleep(60);
+        WriteBytes(ext, std::vector<char>{ 'T', 'H', 'R' });
+        g_uiAnswer = IDYES;
+        SendMessageW(hwnd, WM_ACTIVATE, MAKEWPARAM(WA_ACTIVE, 0), 0);
+        check("ext-reload-yes", DocText() == "THR");
+        // local edit + external change + IDNO -> keep local content
+        Scim<void>(SCI_INSERTTEXT, 0, (sptr_t)"K");
+        Sleep(60);
+        WriteBytes(ext, std::vector<char>{ 'F', 'O', 'U' });
+        g_uiAnswer = IDNO;
+        SendMessageW(hwnd, WM_ACTIVATE, MAKEWPARAM(WA_ACTIVE, 0), 0);
+        check("ext-reload-no-keeps", DocText() == "KTHR");
+        g_uiAnswer = 0;
+    }
+
+    // --- 5. save validation dialog (cancel aborts, ok writes broken json) ---
+    {
+        std::wstring js = base + L"\\save_v.json";
+        WriteBytes(js, std::vector<char>{ '{', '"', 'a', '"', ':', '1', '}' });
+        check("savev-load", LoadFile(js));
+        Scim<void>(SCI_SETTEXT, 0, (sptr_t)"{\"a\":");
+        g_uiAnswer = IDCANCEL;
+        SendMessageW(hwnd, WM_COMMAND, IDM_SAVE, 0);
+        std::vector<char> afterCancel;
+        ReadFileBytes(js, afterCancel);
+        check("savev-cancel-no-write", afterCancel.size() == 7 &&
+            Scim<int>(SCI_GETMODIFY, 0, 0) == 1);
+        g_uiAnswer = IDOK;
+        SendMessageW(hwnd, WM_COMMAND, IDM_SAVE, 0);
+        std::vector<char> afterOk;
+        ReadFileBytes(js, afterOk);
+        check("savev-ok-writes", afterOk.size() == 5 &&
+            memcmp(&afterOk[0], "{\"a\":", 5) == 0 &&
+            Scim<int>(SCI_GETMODIFY, 0, 0) == 0);
+        g_uiAnswer = 0;
+    }
+
+    // --- 5b. zoom persists across LoadFile ---
+    {
+        ApplyZoom(3);
+        std::wstring z = base + L"\\zoom.dat";
+        WriteBytes(z, std::vector<char>{ 'z' });
+        LoadFile(z);
+        check("zoom-persist-load", Scim<int>(SCI_GETZOOM, 0, 0) == 3);
+        SendMessageW(hwnd, WM_COMMAND, IDM_ZOOM_RESET, 0);
+    }
+
+    // --- 5c. save success reports format preserved on status bar ---
+    {
+        std::wstring pj = base + L"\\fmt.json";
+        WriteBytes(pj, std::vector<char>{ '{', '"', 'a', '"', ':', '1', '}' });
+        LoadFile(pj);
+        Scim<void>(SCI_INSERTTEXT, 0, (sptr_t)" ");
+        SendMessageW(hwnd, WM_COMMAND, IDM_SAVE, 0);
+        std::wstring p2;
+        part2(p2);
+        check("save-format-report", p2.find(L"\u683c\u5f0f") != std::wstring::npos);
+    }
+
+    // --- 5d. read-only file: save must fail and keep content/modified ---
+    {
+        std::wstring ro = base + L"\\ro.dat";
+        WriteBytes(ro, std::vector<char>{ 'R', 'O' });
+        LoadFile(ro);
+        Scim<void>(SCI_INSERTTEXT, 0, (sptr_t)"X");
+        SetFileAttributesW(ro.c_str(), FILE_ATTRIBUTE_READONLY);
+        SendMessageW(hwnd, WM_COMMAND, IDM_SAVE, 0);
+        std::vector<char> cur;
+        ReadFileBytes(ro, cur);
+        bool unchanged = cur.size() == 2 && cur[0] == 'R' && cur[1] == 'O';
+        bool stillDirty = Scim<int>(SCI_GETMODIFY, 0, 0) == 1;
+        SetFileAttributesW(ro.c_str(), FILE_ATTRIBUTE_NORMAL);
+        check("readonly-save-blocked", unchanged && stillDirty);
+    }
+
+    // --- 6. find counter + replace-all warning (dialog message path) ---
+    {
+        Scim<void>(SCI_SETTEXT, 0, (sptr_t)"foo foo foo");
+        FINDREPLACEW fr2;
+        ZeroMemory(&fr2, sizeof(fr2));
+        fr2.lStructSize = sizeof(fr2);
+        wchar_t fwhat[16], rwith[16];
+        wcscpy(fwhat, L"foo"); wcscpy(rwith, L"bar");
+        fr2.lpstrFindWhat = fwhat;
+        fr2.lpstrReplaceWith = rwith;
+        fr2.Flags = FR_DOWN;
+        OnFindReplMessage(0, (LPARAM)&fr2);
+        std::wstring p2;
+        part2(p2);
+        check("find-counter-3", p2.find(L"3") != std::wstring::npos);
+        fr2.Flags = FR_DOWN | FR_REPLACEALL;
+        g_uiAnswer = IDCANCEL;
+        OnFindReplMessage(0, (LPARAM)&fr2);
+        check("replaceall-cancel", DocText() == "foo foo foo");
+        g_uiAnswer = IDOK;
+        OnFindReplMessage(0, (LPARAM)&fr2);
+        check("replaceall-ok", DocText() == "bar bar bar");
+        g_uiAnswer = 0;
+    }
+
+    // --- 7. MRU submenu rebuild + click (menu path) ---
+    {
+        std::wstring m1 = base + L"\\mru1.txt";
+        std::wstring m2 = base + L"\\mru2.txt";
+        WriteBytes(m1, std::vector<char>{ '1' });
+        WriteBytes(m2, std::vector<char>{ '2' });
+        g_mruCount = 0;
+        g_mru[0] = m1;
+        g_mru[1] = m2;
+        g_mruCount = 2;
+        SendMessageW(hwnd, WM_INITMENUPOPUP, (WPARAM)g_mRecentMenu, 0);
+        check("mru-menu-2-items", GetMenuItemCount(g_mRecentMenu) == 2);
+        if (PromptSaveIfDirty()) LoadFile(m2);
+        SendMessageW(hwnd, WM_COMMAND, IDM_MRU_BASE + 1, 0);
+        check("mru-click-loads", g_filePath == m2);
+    }
+
+    // --- 8. close guard: dirty + cancel keeps window alive ---
+    {
+        Scim<void>(SCI_INSERTTEXT, 0, (sptr_t)"Z");
+        g_uiAnswer = IDCANCEL;
+        SendMessageW(hwnd, WM_CLOSE, 0, 0);
+        check("close-cancel-alive", IsWindow(hwnd) != 0);
+        g_uiAnswer = 0;
+        Scim<void>(SCI_SETSAVEPOINT, 0, 0);   // clear dirty for exit
+    }
+
+    g_mruSuppress = mruWas;
+    if (rf) {
+        fwprintf(rf, L"TOTAL %d/%d %ls\r\n", pass, total,
+            (pass == total ? L"PASS" : L"FAIL"));
+        fflush(rf);
+        fclose(rf);
+        g_uiTestLog = nullptr;
+    }
+    return pass == total;
+}
+
+// ---------------------------------------------------------------------------
 
 int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmdLineIn, int nShow) {
     g_hInst = hInst;
@@ -1930,12 +2185,14 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmdLineIn, int nShow) {
     if (!argv) argv = CommandLineToArgvW(cmdLineIn, &argc);
     bool selftest = false;
     bool uicheck = false;
+    bool uitest = false;
     bool regassoc = false;
     bool unregassoc = false;
     std::wstring openFile;
     for (int i = 1; i < argc; ++i) {
         if (_wcsicmp(argv[i], L"--selftest") == 0) selftest = true;
         else if (_wcsicmp(argv[i], L"--uicheck") == 0) uicheck = true;
+        else if (_wcsicmp(argv[i], L"--uitest") == 0) uitest = true;
         else if (_wcsicmp(argv[i], L"--register") == 0) regassoc = true;
         else if (_wcsicmp(argv[i], L"--unregister") == 0) unregassoc = true;
         else if (openFile.empty() && argv[i][0] != L'-' &&
@@ -1952,7 +2209,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmdLineIn, int nShow) {
                   : L"\u8bbe\u7f6e\u5931\u8d25\uff1a\u8bf7\u68c0\u67e5\u6743\u9650\u3002")
             : (ok ? L"\u5df2\u53d6\u6d88\u6587\u4ef6\u5173\u8054\u3002"
                   : L"\u53d6\u6d88\u5931\u8d25\u3002");
-        MessageBoxW(nullptr, msg, kAppTitle, MB_OK | icon);
+        AppMsgBox(nullptr, msg, kAppTitle, MB_OK | icon);
         return ok ? 0 : 1;
     }
 
@@ -2055,6 +2312,14 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmdLineIn, int nShow) {
     }
     if (uicheck) {
         bool ok = RunUiCheck(hwnd, openFile);
+        return ok ? 0 : 1;
+    }
+    if (uitest) {
+        g_uiTest = true;
+        ShowWindow(hwnd, SW_HIDE);
+        bool ok = RunUiTest(hwnd);
+        g_uiTest = false;
+        DestroyWindow(hwnd);
         return ok ? 0 : 1;
     }
 
