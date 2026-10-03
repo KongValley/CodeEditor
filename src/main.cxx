@@ -137,14 +137,20 @@ static bool RegGetString(HKEY root, const wchar_t *sub, std::wstring &out) {
     HKEY h;
     if (RegOpenKeyExW(root, sub, 0, KEY_QUERY_VALUE, &h) != ERROR_SUCCESS)
         return false;
-    wchar_t buf[1024];
-    DWORD n = sizeof(buf);
-    DWORD type = 0;
-    LONG rc = RegQueryValueExW(h, nullptr, nullptr, &type, (LPBYTE)buf, &n);
+    DWORD n = 0, type = 0;
+    bool ok = false;
+    if (RegQueryValueExW(h, nullptr, nullptr, &type, nullptr, &n) == ERROR_SUCCESS
+        && type == REG_SZ && n >= sizeof(wchar_t) && n <= 64 * 1024) {
+        std::vector<wchar_t> buf(n / sizeof(wchar_t) + 1, 0);
+        if (RegQueryValueExW(h, nullptr, nullptr, &type, (LPBYTE)&buf[0], &n)
+                == ERROR_SUCCESS) {
+            buf[n / sizeof(wchar_t)] = L'\0';   // hostile values may omit NUL
+            out = &buf[0];
+            ok = true;
+        }
+    }
     RegCloseKey(h);
-    if (rc != ERROR_SUCCESS || type != REG_SZ) return false;
-    out = buf;
-    return true;
+    return ok;
 }
 
 // Set or clear file associations. Install=false also removes the ProgID tree.
@@ -153,21 +159,38 @@ static bool RegGetString(HKEY root, const wchar_t *sub, std::wstring &out) {
 // programs' associations are never destroyed.
 static const wchar_t *kBackupValue = L"CodeEditorPrevProg";
 
-// Read the per-extension backup of the pre-existing ProgID (empty = none).
-static bool RegGetBackup(const wchar_t *ext, std::wstring &out) {
+// Read the per-extension backup of the pre-existing ProgID.
+// Tri-state on purpose: 1 = backup present, 0 = confirmed absent/empty,
+// -1 = read failure (oversized/wrong type/corrupt). Uninstall must treat -1
+// as "leave the extension default untouched" - treating a failed read as
+// "no backup" would delete another program's association.
+static int RegGetBackup(const wchar_t *ext, std::wstring &out) {
     std::wstring key = std::wstring(L"Software\\Classes\\.") + ext;
     HKEY h;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, key.c_str(), 0, KEY_QUERY_VALUE, &h)
         != ERROR_SUCCESS)
-        return false;
-    wchar_t buf[1024];
-    DWORD n = sizeof(buf);
-    DWORD type = 0;
-    LONG rc = RegQueryValueExW(h, kBackupValue, nullptr, &type, (LPBYTE)buf, &n);
+        return 0;
+    DWORD n = 0, type = 0;
+    if (RegQueryValueExW(h, kBackupValue, nullptr, &type, nullptr, &n)
+            != ERROR_SUCCESS) {
+        RegCloseKey(h);
+        return 0;                       // no backup value at all
+    }
+    if (type != REG_SZ || n < sizeof(wchar_t) * 2 || n > 64 * 1024) {
+        RegCloseKey(h);
+        return -1;                      // unreadable: refuse to touch default
+    }
+    std::vector<wchar_t> buf(n / sizeof(wchar_t) + 1, 0);
+    if (RegQueryValueExW(h, kBackupValue, nullptr, &type, (LPBYTE)&buf[0], &n)
+            != ERROR_SUCCESS) {
+        RegCloseKey(h);
+        return -1;
+    }
     RegCloseKey(h);
-    if (rc != ERROR_SUCCESS || type != REG_SZ || buf[0] == L'\0') return false;
-    out = buf;
-    return true;
+    buf[n / sizeof(wchar_t)] = L'\0';   // hostile values may omit NUL
+    if (buf[0] == L'\0') return 0;      // empty marker: "was empty" - no backup
+    out = &buf[0];
+    return 1;
 }
 
 static bool RegSetBackup(const wchar_t *ext, const std::wstring &prog,
@@ -215,8 +238,8 @@ static bool RegisterAssociationsEx(const wchar_t *progId, bool install) {
             std::wstring key = base + L"\\." + kAssocExts[i];
             // remember the previous owner once; re-runs keep the original
             std::wstring backup;
-            bool hadBackup = RegGetBackup(kAssocExts[i], backup);
-            if (!hadBackup) {
+            int bstate = RegGetBackup(kAssocExts[i], backup);
+            if (bstate == 0) {
                 std::wstring cur, empty;
                 if (RegGetString(HKEY_CURRENT_USER, key.c_str(), cur)) {
                     if (cur != progId)
@@ -238,10 +261,11 @@ static bool RegisterAssociationsEx(const wchar_t *progId, bool install) {
         std::wstring cur;
         if (RegGetString(HKEY_CURRENT_USER, key.c_str(), cur) && cur == progId) {
             std::wstring backup;
-            if (RegGetBackup(kAssocExts[i], backup)) {
+            int bstate = RegGetBackup(kAssocExts[i], backup);
+            if (bstate == 1) {
                 // had a previous owner: put it back
                 RegSetString(HKEY_CURRENT_USER, key.c_str(), nullptr, backup);
-            } else {
+            } else if (bstate == 0) {
                 // backup marker present but empty = no prior owner: clear ours
                 HKEY h;
                 if (RegOpenKeyExW(HKEY_CURRENT_USER, key.c_str(), 0,
@@ -250,6 +274,9 @@ static bool RegisterAssociationsEx(const wchar_t *progId, bool install) {
                     RegCloseKey(h);
                 }
             }
+            // bstate == -1: backup unreadable (oversized/corrupt). Leave the
+            // extension default exactly as-is rather than risk deleting
+            // another program's association.
             RegSetBackup(kAssocExts[i], std::wstring(), true);
         }
     }
@@ -282,10 +309,10 @@ static std::wstring ErrText(DWORD err) {
 }
 
 static void ShowError(const wchar_t *what, const std::wstring &path) {
-    wchar_t msg[512];
-    wsprintfW(msg, L"%s\n%s\n\n%s %lu: %s", what, path.c_str(),
-        L"\u9519\u8bef\u4ee3\u7801", GetLastError(), ErrText(GetLastError()).c_str());
-    AppMsgBox(g_hwnd, msg, kAppTitle, MB_OK | MB_ICONERROR);
+    DWORD e = GetLastError();          // capture once: paths can exceed 512 wchars
+    std::wstring msg = std::wstring(what) + L"\n" + path +
+        L"\n\n\u9519\u8bef\u4ee3\u7801 " + std::to_wstring(e) + L": " + ErrText(e);
+    AppMsgBox(g_hwnd, msg.c_str(), kAppTitle, MB_OK | MB_ICONERROR);
 }
 
 static std::wstring BaseName(const std::wstring &path) {
@@ -511,11 +538,10 @@ static bool LoadFile(const std::wstring &path, bool attachLexer = true,
     int forceMode = -1) {
     std::vector<char> buf;
     if (!ReadFileBytes(path, buf)) {
-        ShowError(L"\u65e0\u6cd5\u6253\u5f00\u6587\u4ef6\uff1a", path);
-        return false;
-    }
-    if (!buf.empty() && GetLastError() == ERROR_FILE_TOO_LARGE) {
-        ShowError(L"\u6587\u4ef6\u8d85\u8fc7 256 MB\uff0c\u4e0d\u652f\u6301\u6253\u5f00\uff1a", path);
+        if (GetLastError() == ERROR_FILE_TOO_LARGE)
+            ShowError(L"\u6587\u4ef6\u8d85\u8fc7 256 MB\uff0c\u4e0d\u652f\u6301\u6253\u5f00\uff1a", path);
+        else
+            ShowError(L"\u65e0\u6cd5\u6253\u5f00\u6587\u4ef6\uff1a", path);
         return false;
     }
 
@@ -543,17 +569,25 @@ static bool LoadFile(const std::wstring &path, bool attachLexer = true,
         }
     }
 
+    // The decode buffers below are the only file-sized allocations in this
+    // function (a 256 MB file under a 32-bit 2 GB address space can OOM).
     std::string text;
-    bool decoded = DecodeToText(buf, mode, bomLen, text);
-    if (!decoded) {
-        // UTF-16 decode failure (unpaired surrogate / odd length):
-        // raw byte view still round-trips exactly.
-        mode = MODE_ANSI; hasBom = false; bomLen = 0;
-        text.assign(buf.begin(), buf.end());
-        g_eolMode = MajorityEol(CountEols(text.data(), text.size()));
-    } else {
-        g_eolMode = MajorityEol(CountEols(text.data(), text.size()));
+    bool decoded;
+    try {
+        decoded = DecodeToText(buf, mode, bomLen, text);
+        if (!decoded) {
+            // UTF-16 decode failure (unpaired surrogate / odd length):
+            // raw byte view still round-trips exactly.
+            mode = MODE_ANSI; hasBom = false; bomLen = 0;
+            text.assign(buf.begin(), buf.end());
+        }
+    } catch (const std::bad_alloc &) {
+        AppMsgBox(g_hwnd,
+            L"\u5185\u5b58\u4e0d\u8db3\uff0c\u65e0\u6cd5\u52a0\u8f7d\u6b64\u6587\u4ef6\u3002",
+            kAppTitle, MB_OK | MB_ICONERROR);
+        return false;
     }
+    g_eolMode = MajorityEol(CountEols(text.data(), text.size()));
 
     UINT codepage = (mode == MODE_UTF8 || mode == MODE_UTF16LE
         || mode == MODE_UTF16BE) ? 65001 : 0;
@@ -574,8 +608,16 @@ static bool LoadFile(const std::wstring &path, bool attachLexer = true,
             // SCI_SETTEXT stopped at an embedded NUL. Use ALLOCATE free path:
             // document is not empty-safe; load with explicit length via AddText.
             Scim<void>(SCI_CLEARALL);
-            std::vector<char> tmp(text.size() + 1, 0);
-            memcpy(&tmp[0], text.data(), text.size());
+            std::vector<char> tmp;
+            try {
+                tmp.assign(text.size() + 1, 0);
+                memcpy(&tmp[0], text.data(), text.size());
+            } catch (const std::bad_alloc &) {
+                AppMsgBox(g_hwnd,
+                    L"\u5185\u5b58\u4e0d\u8db3\uff0c\u65e0\u6cd5\u52a0\u8f7d\u6b64\u6587\u4ef6\u3002",
+                    kAppTitle, MB_OK | MB_ICONERROR);
+                return false;
+            }
             Scim<void>(SCI_ADDTEXT, (uptr_t)text.size(), (sptr_t)&tmp[0]);
         }
     }
@@ -848,7 +890,14 @@ static bool ValidateFormat(std::wstring &err, int &line) {
     bool isXml = (ext == L"xml" || ext == L"html" || ext == L"htm");
     if (!isJson && !isXml) return true;
 
-    std::string text = DocText();
+    std::string text;
+    try {
+        text = DocText();
+    } catch (const std::bad_alloc &) {
+        // Validation is an enhancement, not a gate: on OOM allow the save
+        // instead of blocking the user with a dialog they cannot act on.
+        return true;
+    }
     size_t n = text.size();
     auto lineOf = [&](size_t pos) -> int {
         sptr_t p = (sptr_t)pos;
@@ -997,18 +1046,28 @@ static void LoadMru() {
     if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\CodeEditor", 0,
             KEY_QUERY_VALUE, &h) != ERROR_SUCCESS)
         return;
-    wchar_t buf[8 * 512];
-    DWORD n = sizeof(buf);
-    DWORD type = 0;
-    if (RegQueryValueExW(h, L"MRU", nullptr, &type, (LPBYTE)buf, &n) == ERROR_SUCCESS
-        && type == REG_MULTI_SZ) {
-        const wchar_t *p = buf;
-        const wchar_t *end = buf + n / sizeof(wchar_t);
-        g_mruCount = 0;
-        while (p < end && *p && g_mruCount < 8) {
-            size_t len = wcslen(p);
-            g_mru[g_mruCount++] = std::wstring(p, len);
-            p += len + 1;
+    DWORD n = 0, type = 0;
+    if (RegQueryValueExW(h, L"MRU", nullptr, &type, nullptr, &n) == ERROR_SUCCESS
+        && type == REG_MULTI_SZ && n >= sizeof(wchar_t) * 2 && n <= 64 * 1024) {
+        std::vector<wchar_t> buf(n / sizeof(wchar_t) + 2, 0);
+        if (RegQueryValueExW(h, L"MRU", nullptr, &type, (LPBYTE)&buf[0], &n)
+                == ERROR_SUCCESS) {
+            size_t wchars = n / sizeof(wchar_t);
+            buf[wchars] = L'\0';
+            buf[wchars + 1] = L'\0';        // force double-NUL even if corrupt
+            const wchar_t *p = &buf[0];
+            const wchar_t *end = &buf[0] + wchars;
+            int cnt = 0;
+            g_mruCount = 0;
+            while (p < end && *p && cnt < 8) {
+                size_t len = 0;
+                while (p + len < end && p[len]) ++len;    // bounded wcslen
+                // buffer is NUL-forced at [wchars]/[wchars+1] and zero-filled,
+                // so a truncated trailing entry reads in-bounds; accept it
+                g_mru[cnt++] = std::wstring(p, len);
+                p += len + 1;   // past end for a truncated tail: loop exits
+            }
+            g_mruCount = cnt;
         }
     }
     RegCloseKey(h);
@@ -1067,11 +1126,20 @@ static bool SaveFile(const std::wstring &path) {
         return false;
     }
 
-    std::string text = DocText();
+    std::string text;
     std::vector<char> out;
-    if (!EncodeText(text, g_mode, g_bom, g_bomLen, out)) {
+    try {
+        text = DocText();
+        if (!EncodeText(text, g_mode, g_bom, g_bomLen, out)) {
+            CloseHandle(h);
+            AppMsgBox(g_hwnd, L"\u4fdd\u5b58\u5931\u8d25\uff1a\u7f16\u7801\u8f6c\u6362\u5f02\u5e38\u3002",
+                kAppTitle, MB_OK | MB_ICONERROR);
+            return false;
+        }
+    } catch (const std::bad_alloc &) {
         CloseHandle(h);
-        AppMsgBox(g_hwnd, L"\u4fdd\u5b58\u5931\u8d25\uff1a\u7f16\u7801\u8f6c\u6362\u5f02\u5e38\u3002",
+        AppMsgBox(g_hwnd,
+            L"\u5185\u5b58\u4e0d\u8db3\uff0c\u65e0\u6cd5\u4fdd\u5b58\u6b64\u6587\u4ef6\u3002",
             kAppTitle, MB_OK | MB_ICONERROR);
         return false;
     }
@@ -1160,6 +1228,7 @@ static bool DoSaveAsDlg() {
     wchar_t file[MAX_PATH * 4] = L"";
     if (!g_filePath.empty())
         wcsncpy(file, g_filePath.c_str(), MAX_PATH * 4 - 1);
+    file[MAX_PATH * 4 - 1] = L'\0';   // wcsncpy omits NUL when src >= count
     OPENFILENAMEW ofn;
     ZeroMemory(&ofn, sizeof(ofn));
     ofn.lStructSize = sizeof(ofn);
@@ -1246,14 +1315,19 @@ if (doReplace) {
                 Scim<void>(SCI_SETSEARCHFLAGS, g_findMatchCase ? SCFIND_MATCHCASE : 0);
                 sptr_t scan = 0;
                 sptr_t len = Scim<sptr_t>(SCI_GETLENGTH, 0, 0);
-                while (!g_findText.empty() && hits.size() < 9999 && scan <= len) {
-                    Scim<void>(SCI_SETTARGETSTART, (uptr_t)scan);
-                    Scim<void>(SCI_SETTARGETEND, (uptr_t)len);
-                    int pos = Scim<int>(SCI_SEARCHINTARGET, (uptr_t)g_findText.size(),
-                        (sptr_t)g_findText.c_str());
-                    if (pos < 0) break;
-                    hits.push_back((sptr_t)pos);
-                    scan = (sptr_t)pos + (sptr_t)g_findText.size();
+                try {
+                    while (!g_findText.empty() && hits.size() < 9999 && scan <= len) {
+                        Scim<void>(SCI_SETTARGETSTART, (uptr_t)scan);
+                        Scim<void>(SCI_SETTARGETEND, (uptr_t)len);
+                        int pos = Scim<int>(SCI_SEARCHINTARGET, (uptr_t)g_findText.size(),
+                            (sptr_t)g_findText.c_str());
+                        if (pos < 0) break;
+                        hits.push_back((sptr_t)pos);
+                        scan = (sptr_t)pos + (sptr_t)g_findText.size();
+                    }
+                } catch (const std::bad_alloc &) {
+                    SetStatusPart2(L"\u66ff\u6362\u5931\u8d25\uff1a\u5185\u5b58\u4e0d\u8db3");
+                    return;
                 }
             }
             if (hits.empty()) {
@@ -1487,11 +1561,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (!g_filePath.empty()) {
                 std::wstring verr; int vline = 0;
                 if (!ValidateFormat(verr, vline)) {
-                    wchar_t ask[256];
-                    wsprintfW(ask,
-                        L"\u7b2c %d \u884c\u53ef\u80fd\uff1a%s\u3002\u4ecd\u8981\u4fdd\u5b58\u5417\uff1f",
-                        vline, verr.c_str());
-                    if (AppMsgBox(hwnd, ask, kAppTitle,
+                    std::wstring verrShown = verr;
+                    if (verrShown.size() > 160) verrShown.resize(160);   // document text: bound it
+                    std::wstring ask = L"\u7b2c " + std::to_wstring(vline) +
+                        L" \u884c\u53ef\u80fd\uff1a" + verrShown + L"\u3002\u4ecd\u8981\u4fdd\u5b58\u5417\uff1f";
+                    if (AppMsgBox(hwnd, ask.c_str(), kAppTitle,
                             MB_OKCANCEL | MB_ICONWARNING) != IDOK)
                         return 0;
                 }
@@ -1589,7 +1663,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 // verifies the Scintilla child exists and a file round-trips. Window visibility
 // must be eyeballed by the user on a real desktop.
 static bool RunUiCheck(HWND hwnd, const std::wstring &openFile) {
-    FILE *f = _wfopen(L"C:\\cedb\\uicheck-result.txt", L"w, ccs=UTF-8");
+    // Result path follows the machine, not the build farm: a delivery box has
+    // no C:\cedb, and a failed fopen used to silently lose the whole report.
+    wchar_t dir[MAX_PATH];
+    GetTempPathW(MAX_PATH, dir);
+    std::wstring base = dir;
+    base += L"CodeEditorUiCheck";
+    CreateDirectoryW(base.c_str(), nullptr);
+    FILE *f = _wfopen((base + L"\\uicheck-result.txt").c_str(), L"w, ccs=UTF-8");
     bool frameOk = hwnd && IsWindow(hwnd);
     bool sciOk = g_sci && IsWindow(g_sci);
     // pump messages so WM_CREATE completes and the Scintilla child attaches
@@ -1754,13 +1835,13 @@ static bool RunSelftest() {
     std::wstring resultPath = base + L"\\selftest-result.txt";
     FILE *rf = _wfopen(resultPath.c_str(), L"wb, ccs=UTF-8");
     int pass = 0;
-    // +4 extra cases appended below: assoc-reg, format-validate,
-    // backup-overwrite, force-reload.
+    // +5 extra cases appended below: assoc-reg, format-validate,
+    // backup-overwrite, force-reload, mru-corrupt.
     // Suppress MRU writes during selftest so temporary .dat files never leak
     // into the real recent-files list.
     bool mruWasEnabled = g_mruSuppress;
     g_mruSuppress = true;
-    int total = (int)cases.size() + 4;
+    int total = (int)cases.size() + 5;
     for (size_t i = 0; i < cases.size(); ++i) {
         const TestCase &c = cases[i];
         std::wstring in = base + L"\\in_" + std::to_wstring(i) + L".dat";
@@ -1937,6 +2018,84 @@ static bool RunSelftest() {
         g_filePath.clear();
         g_mruSuppress = mruWasEnabled;
         Scim<void>(SCI_SETTEXT, 0, (sptr_t)"");
+    }
+    // 13. mru-corrupt: LoadMru must survive a corrupted/oversized registry
+    //    value. The real MRU is snapshotted first and unconditionally
+    //    restored afterwards - this test must never destroy user data.
+    {
+        HKEY hk;
+        bool had = false;
+        std::vector<char> saved;
+        DWORD savedType = 0;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\CodeEditor", 0,
+                KEY_QUERY_VALUE, &hk) == ERROR_SUCCESS) {
+            DWORD n = 0;
+            if (RegQueryValueExW(hk, L"MRU", nullptr, &savedType, nullptr, &n)
+                    == ERROR_SUCCESS && n > 0) {
+                saved.resize(n);
+                if (RegQueryValueExW(hk, L"MRU", nullptr, &savedType,
+                        (LPBYTE)&saved[0], &n) == ERROR_SUCCESS) {
+                    had = true;
+                    saved.resize(n);
+                }
+            }
+            RegCloseKey(hk);
+        }
+        auto restore = [&]() {
+            HKEY k2;
+            if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\CodeEditor", 0,
+                    nullptr, 0, KEY_SET_VALUE, nullptr, &k2, nullptr)
+                    == ERROR_SUCCESS) {
+                if (had) RegSetValueExW(k2, L"MRU", 0, savedType,
+                    (const BYTE *)&saved[0], (DWORD)saved.size());
+                else RegDeleteValueW(k2, L"MRU");
+                RegCloseKey(k2);
+            }
+        };
+        bool cpass = true;
+        bool aok = false, bok = false;
+        // (a) unterminated entries "A\0B" (no trailing double NUL)
+        {
+            const wchar_t junk[] = { L'A', 0, L'B' };   // 3 wchars, no terminator
+            HKEY k2;
+            if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\CodeEditor", 0,
+                    nullptr, 0, KEY_SET_VALUE, nullptr, &k2, nullptr)
+                    == ERROR_SUCCESS) {
+                RegSetValueExW(k2, L"MRU", 0, REG_MULTI_SZ, (const BYTE *)junk,
+                    sizeof(junk));
+                RegCloseKey(k2);
+            }
+            g_mruCount = 0;
+            LoadMru();
+            aok = g_mruCount == 2 && g_mru[0] == L"A" && g_mru[1] == L"B";
+            if (!aok) cpass = false;
+        }
+        // (b) oversized value must be rejected without touching g_mru
+        {
+            std::vector<wchar_t> big(33 * 1024, L'X');   // > 64 KB cap
+            big[0] = L'A'; big[1] = 0; big[2] = 0;
+            HKEY k2;
+            if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\CodeEditor", 0,
+                    nullptr, 0, KEY_SET_VALUE, nullptr, &k2, nullptr)
+                    == ERROR_SUCCESS) {
+                RegSetValueExW(k2, L"MRU", 0, REG_MULTI_SZ, (const BYTE *)&big[0],
+                    (DWORD)(big.size() * sizeof(wchar_t)));
+                RegCloseKey(k2);
+            }
+            g_mruCount = 0;
+            LoadMru();
+            bok = g_mruCount == 0;
+            if (!bok) cpass = false;
+        }
+        restore();
+        // reload whatever the user really had
+        g_mruCount = 0;
+        LoadMru();
+        if (cpass) ++pass;
+        char line5[120];
+        sprintf_s(line5, sizeof(line5), "mru-corrupt: %s (a=%d b=%d)\r\n",
+            cpass ? "PASS" : "FAIL", aok ? 1 : 0, bok ? 1 : 0);
+        LogLine(rf, line5);
     }
     if (rf) {
         char sum[128];
@@ -2150,6 +2309,13 @@ static bool RunUiTest(HWND hwnd) {
         if (PromptSaveIfDirty()) LoadFile(m2);
         SendMessageW(hwnd, WM_COMMAND, IDM_MRU_BASE + 1, 0);
         check("mru-click-loads", g_filePath == m2);
+    }
+
+    // --- 8b. pathological path through ShowError must not smash the stack ---
+    {
+        std::wstring longPath = base + L"\\" + std::wstring(600, L'x') + L".txt";
+        bool loaded = LoadFile(longPath);   // nonexistent -> ShowError path
+        check("long-path-error-safe", !loaded && IsWindow(hwnd) != 0);
     }
 
     // --- 8. close guard: dirty + cancel keeps window alive ---
