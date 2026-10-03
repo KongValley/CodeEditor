@@ -91,8 +91,6 @@ static const int kMaxFileBytes = 256 * 1024 * 1024;
 #define IDM_FIND      1011
 #define IDM_FINDNEXT  1012
 #define IDM_ABOUT     1013
-#define IDM_REGASSOC  1014
-#define IDM_UNREGASSOC 1015
 #define IDM_RELOAD_UTF8  1016
 #define IDM_RELOAD_GBK   1017
 #define IDM_RELOAD_UTF16 1018
@@ -104,191 +102,6 @@ static const int kMaxFileBytes = 256 * 1024 * 1024;
 
 #define WM_APP_TITLE   (WM_APP + 1)
 #define WM_APP_STATUS  (WM_APP + 2)
-
-// ---------------------------------------------------------------------------
-// File association (registry, HKCU - no admin needed)
-
-static const wchar_t *kProgId = L"CodeEditor.doc";
-static const wchar_t *kProgIdName = L"CodeEditor Document";
-
-static const wchar_t *kAssocExts[] = {
-    L"ini", L"cfg", L"conf", L"properties", L"env", L"json", L"xml",
-    L"yaml", L"yml", L"sql", L"bat", L"cmd", L"html", L"htm",
-    L"js", L"mjs", L"c", L"cpp", L"h", L"hpp", L"cc", L"cxx",
-    L"java", L"cs", L"css", L"py", L"sh", L"txt", L"log",
-};
-static const int kAssocExtCount = (int)(sizeof(kAssocExts) / sizeof(kAssocExts[0]));
-
-static bool RegSetString(HKEY root, const wchar_t *sub, const wchar_t *value,
-    const std::wstring &data) {
-    HKEY h;
-    DWORD disp;
-    if (RegCreateKeyExW(root, sub, 0, nullptr, 0, KEY_SET_VALUE, nullptr,
-        &h, &disp) != ERROR_SUCCESS)
-        return false;
-    LONG rc = RegSetValueExW(h, value, 0, REG_SZ,
-        (const BYTE *)data.c_str(),
-        (DWORD)((data.size() + 1) * sizeof(wchar_t)));
-    RegCloseKey(h);
-    return rc == ERROR_SUCCESS;
-}
-
-static bool RegGetString(HKEY root, const wchar_t *sub, std::wstring &out) {
-    HKEY h;
-    if (RegOpenKeyExW(root, sub, 0, KEY_QUERY_VALUE, &h) != ERROR_SUCCESS)
-        return false;
-    DWORD n = 0, type = 0;
-    bool ok = false;
-    if (RegQueryValueExW(h, nullptr, nullptr, &type, nullptr, &n) == ERROR_SUCCESS
-        && type == REG_SZ && n >= sizeof(wchar_t) && n <= 64 * 1024) {
-        std::vector<wchar_t> buf(n / sizeof(wchar_t) + 1, 0);
-        if (RegQueryValueExW(h, nullptr, nullptr, &type, (LPBYTE)&buf[0], &n)
-                == ERROR_SUCCESS) {
-            buf[n / sizeof(wchar_t)] = L'\0';   // hostile values may omit NUL
-            out = &buf[0];
-            ok = true;
-        }
-    }
-    RegCloseKey(h);
-    return ok;
-}
-
-// Set or clear file associations. Install=false also removes the ProgID tree.
-// On install, the previous .ext default (if any) is backed up per-extension so
-// that uninstall restores whatever owned those files before us - other
-// programs' associations are never destroyed.
-static const wchar_t *kBackupValue = L"CodeEditorPrevProg";
-
-// Read the per-extension backup of the pre-existing ProgID.
-// Tri-state on purpose: 1 = backup present, 0 = confirmed absent/empty,
-// -1 = read failure (oversized/wrong type/corrupt). Uninstall must treat -1
-// as "leave the extension default untouched" - treating a failed read as
-// "no backup" would delete another program's association.
-static int RegGetBackup(const wchar_t *ext, std::wstring &out) {
-    std::wstring key = std::wstring(L"Software\\Classes\\.") + ext;
-    HKEY h;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, key.c_str(), 0, KEY_QUERY_VALUE, &h)
-        != ERROR_SUCCESS)
-        return 0;
-    DWORD n = 0, type = 0;
-    if (RegQueryValueExW(h, kBackupValue, nullptr, &type, nullptr, &n)
-            != ERROR_SUCCESS) {
-        RegCloseKey(h);
-        return 0;                       // no backup value at all
-    }
-    if (type != REG_SZ || n < sizeof(wchar_t) * 2 || n > 64 * 1024) {
-        RegCloseKey(h);
-        return -1;                      // unreadable: refuse to touch default
-    }
-    std::vector<wchar_t> buf(n / sizeof(wchar_t) + 1, 0);
-    if (RegQueryValueExW(h, kBackupValue, nullptr, &type, (LPBYTE)&buf[0], &n)
-            != ERROR_SUCCESS) {
-        RegCloseKey(h);
-        return -1;
-    }
-    RegCloseKey(h);
-    buf[n / sizeof(wchar_t)] = L'\0';   // hostile values may omit NUL
-    if (buf[0] == L'\0') return 0;      // empty marker: "was empty" - no backup
-    out = &buf[0];
-    return 1;
-}
-
-static bool RegSetBackup(const wchar_t *ext, const std::wstring &prog,
-    bool clearIfEmpty) {
-    std::wstring key = std::wstring(L"Software\\Classes\\.") + ext;
-    HKEY h;
-    DWORD disp;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, key.c_str(), 0, nullptr, 0,
-            KEY_SET_VALUE, nullptr, &h, &disp) != ERROR_SUCCESS)
-        return false;
-    LONG rc;
-    if (clearIfEmpty && prog.empty()) {
-        rc = RegDeleteValueW(h, kBackupValue);
-        if (rc != ERROR_SUCCESS && rc != ERROR_FILE_NOT_FOUND) {
-            RegCloseKey(h);
-            return false;
-        }
-    } else {
-        rc = RegSetValueExW(h, kBackupValue, 0, REG_SZ,
-            (const BYTE *)prog.c_str(), (DWORD)((prog.size() + 1) * sizeof(wchar_t)));
-    }
-    RegCloseKey(h);
-    return rc == ERROR_SUCCESS;
-}
-
-static bool RegisterAssociationsEx(const wchar_t *progId, bool install) {
-    wchar_t exe[MAX_PATH * 2] = L"";
-    if (!GetModuleFileNameW(nullptr, exe, MAX_PATH * 2)) return false;
-    std::wstring base = L"Software\\Classes";
-    bool ok = true;
-
-    if (install) {
-        std::wstring icon = L"\"" + std::wstring(exe) + L"\",0";
-        std::wstring cmd = L"\"" + std::wstring(exe) + L"\" \"%1\"";
-        if (!RegSetString(HKEY_CURRENT_USER, base.c_str(), progId, kProgIdName))
-            return false;
-        if (!RegSetString(HKEY_CURRENT_USER,
-                (base + L"\\" + progId + L"\\DefaultIcon").c_str(), nullptr, icon))
-            return false;
-        if (!RegSetString(HKEY_CURRENT_USER,
-                (base + L"\\" + progId + L"\\shell\\open\\command").c_str(),
-                nullptr, cmd))
-            return false;
-        for (int i = 0; i < kAssocExtCount; ++i) {
-            std::wstring key = base + L"\\." + kAssocExts[i];
-            // remember the previous owner once; re-runs keep the original
-            std::wstring backup;
-            int bstate = RegGetBackup(kAssocExts[i], backup);
-            if (bstate == 0) {
-                std::wstring cur, empty;
-                if (RegGetString(HKEY_CURRENT_USER, key.c_str(), cur)) {
-                    if (cur != progId)
-                        RegSetBackup(kAssocExts[i], cur, false);
-                } else {
-                    RegSetBackup(kAssocExts[i], empty, true); // mark "was empty"
-                }
-            }
-            if (!RegSetString(HKEY_CURRENT_USER, key.c_str(), nullptr, progId))
-                ok = false;
-        }
-        SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
-        return ok;
-    }
-
-    // remove: restore what owned each extension before we touched it
-    for (int i = 0; i < kAssocExtCount; ++i) {
-        std::wstring key = base + L"\\." + kAssocExts[i];
-        std::wstring cur;
-        if (RegGetString(HKEY_CURRENT_USER, key.c_str(), cur) && cur == progId) {
-            std::wstring backup;
-            int bstate = RegGetBackup(kAssocExts[i], backup);
-            if (bstate == 1) {
-                // had a previous owner: put it back
-                RegSetString(HKEY_CURRENT_USER, key.c_str(), nullptr, backup);
-            } else if (bstate == 0) {
-                // backup marker present but empty = no prior owner: clear ours
-                HKEY h;
-                if (RegOpenKeyExW(HKEY_CURRENT_USER, key.c_str(), 0,
-                        KEY_SET_VALUE, &h) == ERROR_SUCCESS) {
-                    RegDeleteValueW(h, nullptr);
-                    RegCloseKey(h);
-                }
-            }
-            // bstate == -1: backup unreadable (oversized/corrupt). Leave the
-            // extension default exactly as-is rather than risk deleting
-            // another program's association.
-            RegSetBackup(kAssocExts[i], std::wstring(), true);
-        }
-    }
-    // remove the ProgID tree; missing is fine
-    RegDeleteTreeW(HKEY_CURRENT_USER, (base + L"\\" + progId).c_str());
-    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
-    return true;
-}
-
-static bool RegisterAssociations(bool install) {
-    return RegisterAssociationsEx(kProgId, install);
-}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1612,27 +1425,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 L"\u50cf\u8bb0\u4e8b\u672c\u4e00\u6837\u81ea\u52a8\u8f6c\u6362\u3002",
                 kAppTitle, MB_OK | MB_ICONINFORMATION);
             return 0;
-        case IDM_REGASSOC:
-            if (RegisterAssociations(true))
-                AppMsgBox(hwnd, L"\u5df2\u8bbe\u4e3a\u9ed8\u8ba4\u6253\u5f00\u65b9\u5f0f\uff08\u5305\u62ec .txt\u3001.ini\u3001"
-                    L".json \u7b49 29 \u79cd\u6587\u4ef6\u7c7b\u578b\uff09\u3002",
-                    kAppTitle, MB_OK | MB_ICONINFORMATION);
-            else
-                ShowError(L"\u6ce8\u518c\u6587\u4ef6\u5173\u8054\u5931\u8d25\uff1a", kProgId);
-            return 0;
-        case IDM_UNREGASSOC: {
-            int r = AppMsgBox(hwnd,
-                L"\u5c06\u628a\u6587\u4ef6\u5173\u8054\u6062\u590d\u5230\u8bbe\u7f6e\u524d\u7684\u72b6\u6001\uff08\u5176\u4ed6"
-                L"\u7a0b\u5e8f\u7684\u5173\u8054\u4e0d\u53d7\u5f71\u54cd\uff09\u3002\u786e\u5b9a\u89e3\u9664\u5417\uff1f",
-                kAppTitle, MB_YESNO | MB_ICONQUESTION);
-            if (r != IDYES) return 0;
-            if (RegisterAssociations(false))
-                AppMsgBox(hwnd, L"\u5df2\u89e3\u9664\u6587\u4ef6\u5173\u8054\u3002",
-                    kAppTitle, MB_OK | MB_ICONINFORMATION);
-            else
-                ShowError(L"\u89e3\u9664\u6587\u4ef6\u5173\u8054\u5931\u8d25\uff1a", kProgId);
-            return 0;
-        }
         default:
             // V5: recent-files items (dynamic IDs)
             if (LOWORD(wParam) >= IDM_MRU_BASE &&
@@ -1835,13 +1627,13 @@ static bool RunSelftest() {
     std::wstring resultPath = base + L"\\selftest-result.txt";
     FILE *rf = _wfopen(resultPath.c_str(), L"wb, ccs=UTF-8");
     int pass = 0;
-    // +5 extra cases appended below: assoc-reg, format-validate,
-    // backup-overwrite, force-reload, mru-corrupt.
+    // +4 extra cases appended below: format-validate, backup-overwrite,
+    // force-reload, mru-corrupt.
     // Suppress MRU writes during selftest so temporary .dat files never leak
     // into the real recent-files list.
     bool mruWasEnabled = g_mruSuppress;
     g_mruSuppress = true;
-    int total = (int)cases.size() + 5;
+    int total = (int)cases.size() + 4;
     for (size_t i = 0; i < cases.size(); ++i) {
         const TestCase &c = cases[i];
         std::wstring in = base + L"\\in_" + std::to_wstring(i) + L".dat";
@@ -1873,71 +1665,7 @@ static bool RunSelftest() {
         LogLine(rf, line);
     }
 
-    // 9. association registry round-trip with a throwaway ProgID. Covers both
-    //    directions plus the "restore the previous owner" guarantee: a foreign
-    //    ProgID is planted on .ini before registering; unregister must put it
-    //    back, not delete the key.
-    {
-        const wchar_t *tmppg = L"CodeEditorSelftest.doc";
-        const wchar_t *foreign = L"Notepad.txt";  // Windows' own txt ProgID
-        RegSetString(HKEY_CURRENT_USER, L"Software\\Classes\\.ini",
-            nullptr, foreign);
-        std::wstring txtVal, cmdVal;
-        bool regOk = RegisterAssociationsEx(tmppg, true);
-        bool q2 = RegGetString(HKEY_CURRENT_USER, L"Software\\Classes\\.ini", txtVal)
-            && txtVal == tmppg;
-        bool q3 = RegGetString(HKEY_CURRENT_USER,
-            (std::wstring(L"Software\\Classes\\") + tmppg +
-                L"\\shell\\open\\command").c_str(), cmdVal);
-        bool q4 = q3 && cmdVal.size() > 7 && cmdVal[0] == L'"' &&
-            cmdVal[cmdVal.size() - 6] == L'"' &&
-            cmdVal[cmdVal.size() - 5] == L' ' &&
-            cmdVal[cmdVal.size() - 4] == L'"' &&
-            cmdVal[cmdVal.size() - 3] == L'%' &&
-            cmdVal[cmdVal.size() - 2] == L'1' &&
-            cmdVal[cmdVal.size() - 1] == L'"';
-        bool unOk = RegisterAssociationsEx(tmppg, false);
-        // after unregister, .ini must hold the foreign ProgID again
-        std::wstring back;
-        bool q5 = RegGetString(HKEY_CURRENT_USER, L"Software\\Classes\\.ini", back)
-            && back == foreign;
-        bool q6 = !RegGetString(HKEY_CURRENT_USER,
-            (std::wstring(L"Software\\Classes\\") + tmppg).c_str(), back);
-        // backup marker must be gone after uninstall
-        HKEY hb;
-        bool noMarker = RegOpenKeyExW(HKEY_CURRENT_USER,
-            L"Software\\Classes\\.ini", 0, KEY_QUERY_VALUE, &hb) != ERROR_SUCCESS;
-        if (!noMarker) {
-            wchar_t buf[64];
-            DWORD n = sizeof(buf);
-            DWORD t = 0;
-            noMarker = RegQueryValueExW(hb, L"CodeEditorPrevProg", nullptr, &t,
-                (LPBYTE)buf, &n) != ERROR_SUCCESS;
-            RegCloseKey(hb);
-        }
-        bool sepPass = regOk && q2 && q4 && unOk && q5 && q6 && noMarker;
-        if (sepPass) ++pass;
-        char line[800];
-        sprintf_s(line, sizeof(line), "assoc-reg: %s (reg=%d ini-val=%d cmd=%d unreg=%d restored=%d progid-gone=%d marker-gone=%d) cmd_hex=",
-            sepPass ? "PASS" : "FAIL", regOk ? 1 : 0, q2 ? 1 : 0, q4 ? 1 : 0,
-            unOk ? 1 : 0, q5 ? 1 : 0, q6 ? 1 : 0, noMarker ? 1 : 0);
-        for (int i = 0; i < 32 && i < (int)cmdVal.size(); ++i)
-            sprintf_s(line + strlen(line), sizeof(line) - strlen(line),
-                "%04X", (unsigned)cmdVal[(size_t)i]);
-        strcat_s(line, sizeof(line), "\r\n");
-        LogLine(rf, line);
-        // always restore the planted value; the test must never leave residue
-        RegSetString(HKEY_CURRENT_USER, L"Software\\Classes\\.ini",
-            nullptr, foreign);
-        std::wstring chk;
-        if (!RegGetString(HKEY_CURRENT_USER, L"Software\\Classes\\.ini", chk) ||
-            chk != foreign) {
-            LogLine(rf, "assoc-reg: CLEANUP-FAIL .ini not restored\r\n");
-            if (sepPass) { --pass; sepPass = false; }
-        }
-    }
-
-    // 10. format-validate: pure ValidateFormat checks (no dialogs, no files)
+    // 9. format-validate: pure ValidateFormat checks (no dialogs, no files)
     {
         std::wstring err;
         int line = -1;
@@ -1972,7 +1700,7 @@ static bool RunSelftest() {
         g_filePath.clear();
     }
 
-    // 11. backup-on-overwrite: SaveFile must leave the previous content in .bak
+    // 10. backup-on-overwrite: SaveFile must leave the previous content in .bak
     {
         std::wstring in = base + L"\\bak_in.dat";
         std::wstring out = base + L"\\bak_out.dat";
@@ -1996,7 +1724,7 @@ static bool RunSelftest() {
         LogLine(rf, line3);
     }
 
-    // 12. force-reload: LoadFile(path, attach, forceMode) honours the override
+    // 11. force-reload: LoadFile(path, attach, forceMode) honours the override
     {
         std::wstring p = base + L"\\fr.dat";
         WriteBytes(p, std::vector<char>{ 'A', (char)0xE4, (char)0xB8, (char)0xAD });
@@ -2019,7 +1747,7 @@ static bool RunSelftest() {
         g_mruSuppress = mruWasEnabled;
         Scim<void>(SCI_SETTEXT, 0, (sptr_t)"");
     }
-    // 13. mru-corrupt: LoadMru must survive a corrupted/oversized registry
+    // 12. mru-corrupt: LoadMru must survive a corrupted/oversized registry
     //    value. The real MRU is snapshotted first and unconditionally
     //    restored afterwards - this test must never destroy user data.
     {
@@ -2344,40 +2072,23 @@ static bool RunUiTest(HWND hwnd) {
 int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmdLineIn, int nShow) {
     g_hInst = hInst;
 
-    // Parse args first: --register/--unregister must never touch Scintilla
-    // (shortest path, no window class registration, no CRT window setup).
+    // Parse args before any window/Scintilla setup so test switches run
+    // without paying for window class registration.
     int argc = 0;
     LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (!argv) argv = CommandLineToArgvW(cmdLineIn, &argc);
     bool selftest = false;
     bool uicheck = false;
     bool uitest = false;
-    bool regassoc = false;
-    bool unregassoc = false;
     std::wstring openFile;
     for (int i = 1; i < argc; ++i) {
         if (_wcsicmp(argv[i], L"--selftest") == 0) selftest = true;
         else if (_wcsicmp(argv[i], L"--uicheck") == 0) uicheck = true;
         else if (_wcsicmp(argv[i], L"--uitest") == 0) uitest = true;
-        else if (_wcsicmp(argv[i], L"--register") == 0) regassoc = true;
-        else if (_wcsicmp(argv[i], L"--unregister") == 0) unregassoc = true;
         else if (openFile.empty() && argv[i][0] != L'-' &&
             PathFileExistsW(argv[i])) openFile = argv[i];
     }
     LocalFree(argv);
-
-    // Silent association switches: no Scintilla, no window, exit 0/1.
-    if (regassoc || unregassoc) {
-        bool ok = RegisterAssociations(regassoc);
-        UINT icon = ok ? MB_ICONINFORMATION : MB_ICONERROR;
-        const wchar_t *msg = regassoc
-            ? (ok ? L"\u5df2\u8bbe\u4e3a\u9ed8\u8ba4\u6253\u5f00\u65b9\u5f0f\u3002"
-                  : L"\u8bbe\u7f6e\u5931\u8d25\uff1a\u8bf7\u68c0\u67e5\u6743\u9650\u3002")
-            : (ok ? L"\u5df2\u53d6\u6d88\u6587\u4ef6\u5173\u8054\u3002"
-                  : L"\u53d6\u6d88\u5931\u8d25\u3002");
-        AppMsgBox(nullptr, msg, kAppTitle, MB_OK | icon);
-        return ok ? 0 : 1;
-    }
 
     InitCommonControls();
 
@@ -2439,9 +2150,6 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmdLineIn, int nShow) {
     AppendMenuW(mView, MF_STRING, IDM_ZOOM_OUT, L"\u7f29\u5c0f\u5b57\u53f7(&O)\tCtrl+-");
     AppendMenuW(mView, MF_STRING, IDM_ZOOM_RESET, L"\u91cd\u7f6e\u5b57\u53f7(&0)\tCtrl+0");
     HMENU mHelp = CreatePopupMenu();
-    AppendMenuW(mHelp, MF_STRING, IDM_REGASSOC, L"\u8bbe\u4e3a\u9ed8\u8ba4\u6253\u5f00\u65b9\u5f0f(&D)");
-    AppendMenuW(mHelp, MF_STRING, IDM_UNREGASSOC, L"\u89e3\u9664\u6587\u4ef6\u5173\u8054(&U)");
-    AppendMenuW(mHelp, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(mHelp, MF_STRING, IDM_ABOUT, L"\u5173\u4e8e(&A)");
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)mFile, L"\u6587\u4ef6(&F)");
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)mEdit, L"\u7f16\u8f91(&E)");
